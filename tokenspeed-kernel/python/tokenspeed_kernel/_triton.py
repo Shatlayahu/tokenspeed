@@ -28,18 +28,23 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
-
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
     from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
+
+    # CUDA/ROCm-specific interfaces are unavailable on this NPU path.
+    gl = None
+    gluon = None
+    aggregate = None
+    TensorDescriptor = None
 else:
     import tokenspeed_triton as triton
+    import tokenspeed_triton.experimental.gluon.language as gl
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
     from tokenspeed_triton import language as tl
     from tokenspeed_triton.language.extra import libdevice
 
