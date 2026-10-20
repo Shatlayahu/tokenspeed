@@ -1,9 +1,11 @@
+
 import torch
 import torch_npu
 
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 
 DEVICE = "npu:0"
+
 
 def run_case(dtype, tokens, dim):
     torch.manual_seed(42)
@@ -12,14 +14,27 @@ def run_case(dtype, tokens, dim):
         device=DEVICE, dtype=dtype
     )
 
+    # 使用模型原有的权重加载函数，确保 gemma_weight 同步更新
     with torch.no_grad():
-        norm.weight.copy_(
+        loaded_weight = (
             torch.randn(dim, device=DEVICE, dtype=dtype) * 0.1
         )
+        norm._weight_loader(norm.weight, loaded_weight)
+
+    # 验证预计算的 Gemma 权重是正确的
+    weight_error = (
+        norm.gemma_weight.float()
+        - (norm.weight.float() + 1.0)
+    ).abs().max().item()
+
+    print(
+        f"gemma_weight max difference: {weight_error:.6f}",
+        flush=True,
+    )
 
     x = torch.randn(tokens, dim, device=DEVICE, dtype=dtype)
 
-    # PyTorch FP32 参考计算
+    # PyTorch FP32 参考计算（保留原有流程）
     xf = x.float()
     wf = norm.weight.float()
 
