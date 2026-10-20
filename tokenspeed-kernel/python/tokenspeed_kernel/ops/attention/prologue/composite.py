@@ -158,14 +158,36 @@ def composite_gqa_prologue(
         )
     if rotary is not None:
         positions, table = _rope_table(rotary)
-        q, k = apply_rope(
-            positions,
-            q,
-            k,
-            cache.k_cache.shape[-1],
-            table,
-            is_neox=rotary.style is RopeStyle.NEOX,
-        )
+
+        from tokenspeed_kernel.platform import current_platform
+
+        if current_platform().is_npu:
+            from tokenspeed_kernel_npu.ops.rotary_embedding import (
+                apply_rope as npu_apply_rope,
+            )
+
+            # Ascend 实现原地修改 Q/K，返回 None。
+            # clone 避免直接改变上游传入的 Tensor。
+            q = q.contiguous().clone()
+            k = k.contiguous().clone()
+
+            npu_apply_rope(
+                positions=positions,
+                q=q,
+                k=k,
+                head_size=cache.k_cache.shape[-1],
+                cos_sin_cache=table,
+                is_neox=rotary.style is RopeStyle.NEOX,
+            )
+        else:
+            q, k = apply_rope(
+                positions,
+                q,
+                k,
+                cache.k_cache.shape[-1],
+                table,
+                is_neox=rotary.style is RopeStyle.NEOX,
+            )
     _write_kv(cache, k, v, enable_pdl)
     return GQAPrologueOutput(
         q=q, k=k if return_kv else None, v=v if return_kv else None

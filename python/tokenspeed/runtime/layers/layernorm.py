@@ -53,6 +53,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _platform = current_platform()
 _is_amd = _platform.is_amd
+_is_npu = _platform.is_npu
 
 
 def _torch_allreduce_residual_rmsnorm(
@@ -269,7 +270,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_amd or _is_npu:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
