@@ -53,6 +53,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _platform = current_platform()
 _is_amd = _platform.is_amd
+_is_npu = _platform.is_npu
 
 
 def _torch_allreduce_residual_rmsnorm(
@@ -269,13 +270,23 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
-            if x.shape[0] == 0:
-                if residual is not None:
-                    return x, residual
-                else:
-                    return x
+        if _is_npu:
+            gamma = self.gemma_weight
+
+            if gamma.device != x.device or gamma.dtype != x.dtype:
+                gamma = gamma.to(device=x.device, dtype=x.dtype)
+
+            return rmsnorm(
+                x,
+                gamma,
+                self.variance_epsilon,
+                residual=residual,
+            )
+
+        elif _is_amd:
+            # 保留原来的 AMD PyTorch 实现
             orig_dtype = x.dtype
+
             if residual is not None:
                 x = x + residual
                 residual = x
@@ -285,6 +296,7 @@ class GemmaRMSNorm(torch.nn.Module):
             x = x * torch.rsqrt(variance + self.variance_epsilon)
             x = x * (1.0 + self.weight.float())
             x = x.to(orig_dtype)
+
             return x if residual is None else (x, residual)
         else:
             if residual is not None:

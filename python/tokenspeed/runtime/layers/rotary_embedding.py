@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.attention.prologue import MRope, RopeStyle, Rotary
 from tokenspeed_kernel.ops.embedding import apply_rope
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -138,6 +139,20 @@ class RotaryEmbedding(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is not None:
             raise ValueError("embedding.rope does not support offsets")
+        if current_platform().is_npu:
+            from tokenspeed_kernel_npu.ops.rotary_embedding import (
+                apply_rope as npu_apply_rope,
+            )
+
+            npu_apply_rope(
+                positions=positions,
+                q=query,
+                k=key,
+                head_size=self.head_size,
+                cos_sin_cache=self.cos_sin_cache,
+                is_neox=self.is_neox_style,
+            )
+            return query, key
         return apply_rope(
             positions=positions,
             q=query,
