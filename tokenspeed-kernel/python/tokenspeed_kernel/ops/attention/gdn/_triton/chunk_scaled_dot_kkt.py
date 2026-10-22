@@ -52,16 +52,24 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    NUM_COL_TILES: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-        # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
+
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    tile_id = tl.program_id(2)
+    tile_m = tile_id // NUM_COL_TILES
+    tile_n = tile_id % NUM_COL_TILES
+
     i_b, i_h = i_bh // H, i_bh % H
+
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
             chunk_indices + i_t * 2 + 1
@@ -72,42 +80,86 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    o_t = tl.arange(0, BT)
+
+    row_offsets = tile_m * BM + tl.arange(0, BM)
+    col_offsets = tile_n * BN + tl.arange(0, BN)
 
     p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+        beta + bos * H + i_h,
+        (T,),
+        (H,),
+        (i_t * BT + tile_m * BM,),
+        (BM,),
+        (0,),
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    b_A = tl.zeros([BM, BN], dtype=tl.float32)
+
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
+        k_base = k + (bos * Hg + i_h // (H // Hg)) * K
+
+        p_k_m = tl.make_block_ptr(
+            k_base,
             (T, K),
             (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
+            (i_t * BT + tile_m * BM, i_k * BK),
+            (BM, BK),
             (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = b_k * b_beta[:, None]
-        b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
+        p_k_n = tl.make_block_ptr(
+            k_base,
+            (T, K),
+            (Hg * K, 1),
+            (i_t * BT + tile_n * BN, i_k * BK),
+            (BN, BK),
+            (1, 0),
+        )
+
+        b_k_m = tl.load(p_k_m, boundary_check=(0, 1))
+        b_k_n = tl.load(p_k_n, boundary_check=(0, 1))
+
+        b_km_beta = b_k_m * b_beta[:, None]
+        b_A += tl.dot(b_km_beta.to(b_k_m.dtype), tl.trans(b_k_n))
 
     if USE_G:
-        p_g = tl.make_block_ptr(
-            g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+        p_g_m = tl.make_block_ptr(
+            g_cumsum + bos * H + i_h,
+            (T,),
+            (H,),
+            (i_t * BT + tile_m * BM,),
+            (BM,),
+            (0,),
         )
-        b_g = tl.load(p_g, boundary_check=(0,))
-        b_g_diff = b_g[:, None] - b_g[None, :]
+        p_g_n = tl.make_block_ptr(
+            g_cumsum + bos * H + i_h,
+            (T,),
+            (H,),
+            (i_t * BT + tile_n * BN,),
+            (BN,),
+            (0,),
+        )
+
+        b_g_m = tl.load(p_g_m, boundary_check=(0,))
+        b_g_n = tl.load(p_g_n, boundary_check=(0,))
+        b_g_diff = b_g_m[:, None] - b_g_n[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
-    b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
+    b_A = tl.where(
+        row_offsets[:, None] > col_offsets[None, :],
+        b_A,
+        0,
+    )
+
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (BT * H, 1),
+        (i_t * BT + tile_m * BM, tile_n * BN),
+        (BM, BN),
+        (1, 0),
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
-
-
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -149,7 +201,7 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H, triton.cdiv(BT, 32) * triton.cdiv(BT, 32))](
         k=k,
         beta=beta,
         g_cumsum=g_cumsum,
@@ -162,10 +214,15 @@ def chunk_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         BK=64,
+        BM=32,
+        BN=32,
+        NUM_COL_TILES=triton.cdiv(BT, 32),
         # gfx950: four waves are faster than eight.
         num_warps=4 if current_platform().is_cdna4 else 8,
-        num_stages=3,
+        num_stages=1,
         ENABLE_PDL=enable_pdl,
+        enable_ubuf_saving=True,
+        multibuffer=False,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return A
