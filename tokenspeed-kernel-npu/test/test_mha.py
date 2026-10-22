@@ -80,6 +80,24 @@ def test_mha_prefill() -> None:
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_mha_prefill_head_dim_256() -> None:
+    """Qwen3.5 uses a head size unsupported by the fused Ascend TND op."""
+    cumulative = torch.tensor([0, 3, 8], dtype=torch.int32, device="npu")
+    q = torch.randn(8, 4, 256, dtype=torch.bfloat16, device="npu")
+    k = torch.randn(8, 2, 256, dtype=torch.bfloat16, device="npu")
+    v = torch.randn_like(k)
+
+    output = mha_prefill(q, k, v, cumulative, [0, 3, 8], 5)
+    expected = torch.cat(
+        [
+            _attention(q[:3], k[:3], v[:3], causal=True),
+            _attention(q[3:], k[3:], v[3:], causal=True),
+        ]
+    )
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_mha_extend_with_paged_cache() -> None:
     page_size = 128
     q_lengths = [2, 3]
