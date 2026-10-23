@@ -1,6 +1,5 @@
 import torch
 import torch_npu
-
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
 DEVICE = "npu:0"
@@ -12,31 +11,20 @@ def run_case(dtype, num_tokens, num_heads, head_dim, gate_layout):
     hidden_dim = num_heads * head_dim
 
     # Attention 的输出必须是二维 contiguous Tensor
-    x = torch.randn(
-        num_tokens, hidden_dim,
-        device=DEVICE, dtype=dtype
-    ).contiguous()
+    x = torch.randn(num_tokens, hidden_dim, device=DEVICE, dtype=dtype).contiguous()
 
     if gate_layout == "2d":
-        gate = torch.randn(
-            num_tokens, hidden_dim,
-            device=DEVICE, dtype=dtype
-        )
+        gate = torch.randn(num_tokens, hidden_dim, device=DEVICE, dtype=dtype)
     else:
         # 模拟 Qwen3.5 的 q_gate 打包布局
         packed = torch.randn(
-            num_tokens, num_heads * 2 * head_dim,
-            device=DEVICE, dtype=dtype
+            num_tokens, num_heads * 2 * head_dim, device=DEVICE, dtype=dtype
         )
 
-        heads = packed.view(
-            num_tokens, num_heads, 2, head_dim
-        )
+        heads = packed.view(num_tokens, num_heads, 2, head_dim)
         _, gate = heads.unbind(dim=2)
 
-        assert gate.shape == (
-            num_tokens, num_heads, head_dim
-        )
+        assert gate.shape == (num_tokens, num_heads, head_dim)
         assert gate.stride(-1) == 1
 
     # 保存原始输入，避免被原地修改
@@ -46,8 +34,7 @@ def run_case(dtype, num_tokens, num_heads, head_dim, gate_layout):
     # 独立 PyTorch 参考计算
     # FP32 中计算 Sigmoid，再转换到目标 dtype
     expected = (
-        original_x.float()
-        * torch.sigmoid(gate.reshape(num_tokens, -1).float())
+        original_x.float() * torch.sigmoid(gate.reshape(num_tokens, -1).float())
     ).to(dtype)
 
     # 执行 Ascend Triton Kernel
@@ -81,7 +68,7 @@ def run_case(dtype, num_tokens, num_heads, head_dim, gate_layout):
         f"gate={gate_layout}, "
         f"gate_stride={gate.stride()}, "
         f"max_error={error:.6f}",
-        flush=True
+        flush=True,
     )
 
 

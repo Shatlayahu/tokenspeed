@@ -1,20 +1,19 @@
 import math
+
 import torch
 import torch_npu
-
-from tokenspeed_kernel.ops.attention.prologue import (
-    gqa_prologue,
-    HeadNorm,
-    Rotary,
-    RopeStyle,
-    HeadKVCache,
-)
-from tokenspeed_kernel.ops.attention.mha import (
-    mha_prefill,
-    mha_decode_with_kvcache,
-)
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-
+from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_with_kvcache,
+    mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.prologue import (
+    HeadKVCache,
+    HeadNorm,
+    RopeStyle,
+    Rotary,
+    gqa_prologue,
+)
 
 DEVICE = "npu:0"
 DTYPE = torch.bfloat16
@@ -32,10 +31,7 @@ torch.manual_seed(42)
 
 def make_rope_table(max_positions=128, rotary_dim=64):
     inv_freq = 1.0 / (
-        10000 ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32)
-            / rotary_dim
-        )
+        10000 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
     )
     freqs = torch.outer(
         torch.arange(max_positions, dtype=torch.float32),
@@ -83,8 +79,12 @@ rope_table = make_rope_table(rotary_dim=64)
 # Flat view for GQA Prologue writes.
 # Paged view for MHA Decode reads.
 k_pages = torch.zeros(
-    1, PAGE_SIZE, KV_HEADS, HEAD_DIM,
-    device=DEVICE, dtype=DTYPE,
+    1,
+    PAGE_SIZE,
+    KV_HEADS,
+    HEAD_DIM,
+    device=DEVICE,
+    dtype=DTYPE,
 )
 v_pages = torch.zeros_like(k_pages)
 
@@ -100,22 +100,26 @@ history_v = []
 
 # Create Q/K/V and a 3D strided gate.
 packed = torch.randn(
-    TOTAL, Q_HEADS, 2, HEAD_DIM,
-    device=DEVICE, dtype=DTYPE,
+    TOTAL,
+    Q_HEADS,
+    2,
+    HEAD_DIM,
+    device=DEVICE,
+    dtype=DTYPE,
 )
 q_all, gate_all = packed.unbind(dim=2)
 
 k_all = torch.randn(
-    TOTAL, KV_HEADS * HEAD_DIM,
-    device=DEVICE, dtype=DTYPE,
+    TOTAL,
+    KV_HEADS * HEAD_DIM,
+    device=DEVICE,
+    dtype=DTYPE,
 )
 v_all = torch.randn_like(k_all)
 
 
 def prepare(start, length, return_kv):
-    positions = torch.arange(
-        start, start + length, dtype=torch.int64, device=DEVICE
-    )
+    positions = torch.arange(start, start + length, dtype=torch.int64, device=DEVICE)
 
     rotary = Rotary(
         cos_sin_cache=rope_table,
@@ -124,9 +128,7 @@ def prepare(start, length, return_kv):
         mrope=None,
     )
 
-    slots = torch.arange(
-        start, start + length, dtype=torch.int32, device=DEVICE
-    )
+    slots = torch.arange(start, start + length, dtype=torch.int32, device=DEVICE)
 
     cache = HeadKVCache(
         k_cache=k_flat,
@@ -136,9 +138,9 @@ def prepare(start, length, return_kv):
     )
 
     output = gqa_prologue(
-        q=q_all[start:start + length].reshape(length, -1),
-        k=k_all[start:start + length],
-        v=v_all[start:start + length],
+        q=q_all[start : start + length].reshape(length, -1),
+        k=k_all[start : start + length],
+        v=v_all[start : start + length],
         norm=norm,
         rotary=rotary,
         cache=cache,
@@ -154,8 +156,8 @@ def prepare(start, length, return_kv):
     # Use the actual cache contents for K/V, including Decode.
     # Prior GQA tests already compared these against independent
     # RMSNorm + RoPE reference calculations.
-    new_k = k_flat[start:start + length].float().cpu()
-    new_v = v_flat[start:start + length].float().cpu()
+    new_k = k_flat[start : start + length].float().cpu()
+    new_v = v_flat[start : start + length].float().cpu()
 
     history_k.extend([row.clone() for row in new_k])
     history_v.extend([row.clone() for row in new_v])
@@ -170,18 +172,16 @@ def check_attention(actual, q, gate, label):
     k_cpu = torch.stack(history_k)
     v_cpu = torch.stack(history_v)
 
-    expected = reference_attention(
-        q.float().cpu(), k_cpu, v_cpu
-    ).reshape(q.shape[0], -1)
+    expected = reference_attention(q.float().cpu(), k_cpu, v_cpu).reshape(
+        q.shape[0], -1
+    )
 
     # Apply the same BF16 output rounding as an attention kernel.
     expected = expected.to(DTYPE).float()
 
     # Reference gate multiplication in FP32.
     expected_gated = (
-        expected * torch.sigmoid(
-            gate.reshape(q.shape[0], -1).float().cpu()
-        )
+        expected * torch.sigmoid(gate.reshape(q.shape[0], -1).float().cpu())
     ).to(DTYPE)
 
     # Actual in-place Ascend output gate.
@@ -197,8 +197,10 @@ def check_attention(actual, q, gate, label):
     error = (actual_cpu - expected_cpu).abs().max().item()
 
     torch.testing.assert_close(
-        actual_cpu, expected_cpu,
-        atol=0.06, rtol=0.06,
+        actual_cpu,
+        expected_cpu,
+        atol=0.06,
+        rtol=0.06,
     )
 
     print(
@@ -216,9 +218,7 @@ q, prepared = prepare(0, PREFILL_LEN, return_kv=True)
 assert prepared.k is not None
 assert prepared.v is not None
 
-cu = torch.tensor(
-    [0, PREFILL_LEN], dtype=torch.int32, device=DEVICE
-)
+cu = torch.tensor([0, PREFILL_LEN], dtype=torch.int32, device=DEVICE)
 
 prefill_result = mha_prefill(
     q=q,
@@ -245,9 +245,7 @@ check_attention(
 for step in range(DECODE_STEPS):
     token_index = PREFILL_LEN + step
 
-    q, prepared = prepare(
-        token_index, 1, return_kv=False
-    )
+    q, prepared = prepare(token_index, 1, return_kv=False)
 
     assert prepared.k is None
     assert prepared.v is None
@@ -272,7 +270,7 @@ for step in range(DECODE_STEPS):
     check_attention(
         decode_result,
         q,
-        gate_all[token_index:token_index + 1],
+        gate_all[token_index : token_index + 1],
         f"Decode step {step + 1}",
     )
 

@@ -1,11 +1,11 @@
 import torch
-import torch_npu
 import torch.nn.functional as F
-
+import torch_npu
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
     build_causal_conv1d_prefill_metadata,
 )
+
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
 )
@@ -24,9 +24,7 @@ x = torch.randn(length, channels, device=device, dtype=dtype).T
 weight = torch.randn(channels, width, device=device, dtype=dtype) * 0.1
 
 # 分配两个缓存位置：0 未使用，1 属于当前请求
-conv_states = torch.zeros(
-    2, channels, width - 1, device=device, dtype=dtype
-)
+conv_states = torch.zeros(2, channels, width - 1, device=device, dtype=dtype)
 
 # 保存原始输入和状态
 original_x = x.clone()
@@ -50,9 +48,7 @@ has_initial_state = torch.tensor([False], device=device)
 reference_outputs = []
 
 for t in range(length):
-    window = torch.zeros(
-        channels, width, device=device, dtype=torch.float32
-    )
+    window = torch.zeros(channels, width, device=device, dtype=torch.float32)
 
     for k in range(width):
         source_t = t - (width - 1) + k
@@ -66,7 +62,7 @@ expected_output = torch.stack(reference_outputs, dim=1).to(dtype)
 
 # Prefill 完成后，保存最后 width-1 个卷积输入
 expected_states = original_states.clone()
-expected_states[1] = original_x[:, -(width - 1):]
+expected_states[1] = original_x[:, -(width - 1) :]
 
 # 4. 调用 TokenSpeed Prefill Kernel
 actual_output = causal_conv1d_fn(
@@ -86,9 +82,7 @@ actual_output = causal_conv1d_fn(
 torch.npu.synchronize()
 
 # 5. 检查输出
-output_error = (
-    actual_output.float() - expected_output.float()
-).abs().max().item()
+output_error = (actual_output.float() - expected_output.float()).abs().max().item()
 
 print("Output max absolute error:", output_error)
 
@@ -101,9 +95,7 @@ torch.testing.assert_close(
 print("Conv1D Prefill output: PASSED")
 
 # 6. 检查 Conv State
-state_error = (
-    conv_states.float() - expected_states.float()
-).abs().max().item()
+state_error = (conv_states.float() - expected_states.float()).abs().max().item()
 
 print("State max absolute error:", state_error)
 

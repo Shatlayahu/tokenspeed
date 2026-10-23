@@ -29,6 +29,7 @@ import importlib.util
 import sys
 
 import torch
+
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
@@ -42,11 +43,11 @@ if _IS_NPU:
 else:
     import tokenspeed_triton as triton
     import tokenspeed_triton.experimental.gluon.language as gl
+    from tokenspeed_triton import language as tl
     from tokenspeed_triton.experimental import gluon
     from tokenspeed_triton.language.core import _aggregate as aggregate
-    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
-    from tokenspeed_triton import language as tl
     from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
     try:
         import tokenspeed_triton.profiler as proton

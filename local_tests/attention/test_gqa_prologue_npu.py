@@ -1,12 +1,11 @@
 import torch
 import torch_npu
-
 from tokenspeed_kernel.ops.attention.prologue import (
-    gqa_prologue,
-    HeadNorm,
-    Rotary,
-    RopeStyle,
     HeadKVCache,
+    HeadNorm,
+    RopeStyle,
+    Rotary,
+    gqa_prologue,
 )
 
 DEVICE = "npu:0"
@@ -20,9 +19,9 @@ def reference_norm(x, weight):
     """CPU FP32 reference with Ascend's BF16 weight rounding."""
     x = x.float()
     w = (weight.float() + 1.0).to(weight.dtype).float()
-    return (
-        x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * w
-    ).to(torch.bfloat16)
+    return (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * w).to(
+        torch.bfloat16
+    )
 
 
 def reference_rope(x, cache, positions, rotary_dim):
@@ -51,25 +50,12 @@ def run_case(tokens, factor, return_kv):
     slots_count = 32
 
     # Use BF16: the registered composite Ascend path supports BF16/FP16.
-    q = torch.randn(
-        tokens, Q_HEADS * HEAD_DIM,
-        device=DEVICE, dtype=torch.bfloat16
-    )
-    k = torch.randn(
-        tokens, KV_HEADS * HEAD_DIM,
-        device=DEVICE, dtype=torch.bfloat16
-    )
-    v = torch.randn(
-        tokens, KV_HEADS * HEAD_DIM,
-        device=DEVICE, dtype=torch.bfloat16
-    )
+    q = torch.randn(tokens, Q_HEADS * HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(tokens, KV_HEADS * HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(tokens, KV_HEADS * HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
 
-    q_weight = (
-        torch.randn(HEAD_DIM, device=DEVICE, dtype=torch.bfloat16) * 0.1
-    )
-    k_weight = (
-        torch.randn(HEAD_DIM, device=DEVICE, dtype=torch.bfloat16) * 0.1
-    )
+    q_weight = torch.randn(HEAD_DIM, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    k_weight = torch.randn(HEAD_DIM, device=DEVICE, dtype=torch.bfloat16) * 0.1
 
     norm = HeadNorm(
         q_weight=q_weight,
@@ -78,17 +64,12 @@ def run_case(tokens, factor, return_kv):
         eps=EPS,
     )
 
-    positions = torch.arange(
-        3, 3 + tokens, device=DEVICE, dtype=torch.int64
-    )
+    positions = torch.arange(3, 3 + tokens, device=DEVICE, dtype=torch.int64)
 
     # Build an ordinary NeoX cos/sin table.
     base = 10000.0
     inv_freq = 1.0 / (
-        base ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32)
-            / rotary_dim
-        )
+        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
     )
     freqs = torch.outer(torch.arange(64, dtype=torch.float32), inv_freq)
     cos_sin_cpu = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
@@ -104,8 +85,7 @@ def run_case(tokens, factor, return_kv):
     slots = slots_cpu.to(DEVICE)
 
     k_cache = torch.zeros(
-        slots_count, KV_HEADS, HEAD_DIM,
-        device=DEVICE, dtype=torch.bfloat16
+        slots_count, KV_HEADS, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
     )
     v_cache = torch.zeros_like(k_cache)
 
@@ -117,14 +97,8 @@ def run_case(tokens, factor, return_kv):
     )
 
     # Independent CPU reference
-    q_ref = reference_norm(
-        q.cpu().view(tokens, Q_HEADS, HEAD_DIM),
-        q_weight.cpu()
-    )
-    k_ref = reference_norm(
-        k.cpu().view(tokens, KV_HEADS, HEAD_DIM),
-        k_weight.cpu()
-    )
+    q_ref = reference_norm(q.cpu().view(tokens, Q_HEADS, HEAD_DIM), q_weight.cpu())
+    k_ref = reference_norm(k.cpu().view(tokens, KV_HEADS, HEAD_DIM), k_weight.cpu())
 
     pos_cpu = positions.cpu()
     q_ref = reference_rope(q_ref, cos_sin_cpu, pos_cpu, rotary_dim)
@@ -152,19 +126,22 @@ def run_case(tokens, factor, return_kv):
     torch.testing.assert_close(
         result.q.float().cpu().reshape(tokens, Q_HEADS, HEAD_DIM),
         q_ref.float(),
-        atol=atol, rtol=rtol,
+        atol=atol,
+        rtol=rtol,
     )
 
     # Check written cache regardless of return_kv.
     torch.testing.assert_close(
         k_cache[slots.long()].float().cpu(),
         k_ref.float(),
-        atol=atol, rtol=rtol,
+        atol=atol,
+        rtol=rtol,
     )
     torch.testing.assert_close(
         v_cache[slots.long()].cpu(),
         v_ref,
-        atol=0, rtol=0,
+        atol=0,
+        rtol=0,
     )
 
     if return_kv:
@@ -174,12 +151,14 @@ def run_case(tokens, factor, return_kv):
         torch.testing.assert_close(
             result.k.float().cpu().reshape(tokens, KV_HEADS, HEAD_DIM),
             k_ref.float(),
-            atol=atol, rtol=rtol,
+            atol=atol,
+            rtol=rtol,
         )
         torch.testing.assert_close(
             result.v.cpu().reshape(tokens, KV_HEADS, HEAD_DIM),
             v_ref,
-            atol=0, rtol=0,
+            atol=0,
+            rtol=0,
         )
     else:
         assert result.k is None
@@ -192,9 +171,11 @@ def run_case(tokens, factor, return_kv):
     assert torch.count_nonzero(v_cache[unused]).item() == 0
 
     q_error = (
-        result.q.float().cpu().reshape(tokens, Q_HEADS, HEAD_DIM)
-        - q_ref.float()
-    ).abs().max().item()
+        (result.q.float().cpu().reshape(tokens, Q_HEADS, HEAD_DIM) - q_ref.float())
+        .abs()
+        .max()
+        .item()
+    )
 
     print(
         f"PASSED | tokens={tokens}, factor={factor}, "

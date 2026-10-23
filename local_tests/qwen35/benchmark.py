@@ -13,9 +13,8 @@ import time
 from pathlib import Path
 
 import requests
-from transformers import AutoTokenizer
-
 from common import write_json
+from transformers import AutoTokenizer
 
 
 def comma_ints(value: str) -> list[int]:

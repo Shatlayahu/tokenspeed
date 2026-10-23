@@ -1,6 +1,6 @@
 import torch
-import torch_npu
 import torch.nn.functional as F
+import torch_npu
 
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_update,
@@ -18,9 +18,7 @@ def run_case(batch, dim, dtype, activation):
     bias = torch.randn(dim, device=device, dtype=dtype)
 
     # Kernel 使用的真实状态
-    state = torch.randn(
-        batch, dim, width - 1, device=device, dtype=dtype
-    )
+    state = torch.randn(batch, dim, width - 1, device=device, dtype=dtype)
 
     # 参考实现使用独立状态
     ref_state = state.clone()
@@ -32,13 +30,11 @@ def run_case(batch, dim, dtype, activation):
         original_x = x.clone()
 
         # PyTorch 参考计算：使用 FP32 累加
-        window = torch.cat(
-            [ref_state, original_x.unsqueeze(-1)], dim=-1
-        )
+        window = torch.cat([ref_state, original_x.unsqueeze(-1)], dim=-1)
 
-        expected = (
-            window.float() * weight.float().unsqueeze(0)
-        ).sum(dim=-1) + bias.float().unsqueeze(0)
+        expected = (window.float() * weight.float().unsqueeze(0)).sum(
+            dim=-1
+        ) + bias.float().unsqueeze(0)
 
         if activation == "silu":
             expected = F.silu(expected)

@@ -1,11 +1,11 @@
 import torch
-import torch_npu
 import torch.nn.functional as F
-
+import torch_npu
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
     build_causal_conv1d_prefill_metadata,
 )
+
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
 )
@@ -20,26 +20,17 @@ def run_case(lengths, channels, dtype, history_mode):
     total_tokens = sum(lengths)
 
     # 1. 输入与卷积权重
-    x = torch.randn(
-        total_tokens, channels, device=DEVICE, dtype=dtype
-    ).T
+    x = torch.randn(total_tokens, channels, device=DEVICE, dtype=dtype).T
 
-    weight = torch.randn(
-        channels, WIDTH, device=DEVICE, dtype=dtype
-    ) * 0.1
+    weight = torch.randn(channels, WIDTH, device=DEVICE, dtype=dtype) * 0.1
 
     # 多个缓存槽位，0 号不使用
-    state = torch.randn(
-        batch + 2, channels, WIDTH - 1,
-        device=DEVICE, dtype=dtype
-    )
+    state = torch.randn(batch + 2, channels, WIDTH - 1, device=DEVICE, dtype=dtype)
 
     original_state = state.clone()
 
     # 每个请求对应不同的缓存位置
-    cache_indices = torch.arange(
-        1, batch + 1, device=DEVICE, dtype=torch.int32
-    )
+    cache_indices = torch.arange(1, batch + 1, device=DEVICE, dtype=torch.int32)
 
     if history_mode == "none":
         flags = [False] * batch
@@ -48,9 +39,7 @@ def run_case(lengths, channels, dtype, history_mode):
     else:
         flags = [i % 2 == 1 for i in range(batch)]
 
-    has_initial_state = torch.tensor(
-        flags, device=DEVICE, dtype=torch.bool
-    )
+    has_initial_state = torch.tensor(flags, device=DEVICE, dtype=torch.bool)
 
     # 2. 构造 Prefill Metadata
     lengths_cpu = torch.tensor(lengths, dtype=torch.int32)
@@ -59,9 +48,7 @@ def run_case(lengths, channels, dtype, history_mode):
     for length in lengths:
         offsets.append(offsets[-1] + length)
 
-    boundaries = torch.tensor(
-        offsets, device=DEVICE, dtype=torch.int32
-    )
+    boundaries = torch.tensor(offsets, device=DEVICE, dtype=torch.int32)
 
     metadata = build_causal_conv1d_prefill_metadata(
         boundaries,
@@ -85,16 +72,12 @@ def run_case(lengths, channels, dtype, history_mode):
         if flags[b]:
             history = state_cpu[slot].clone()
         else:
-            history = torch.zeros(
-                channels, WIDTH - 1, dtype=torch.float32
-            )
+            history = torch.zeros(channels, WIDTH - 1, dtype=torch.float32)
 
         for t in range(length):
             current = x_cpu[:, start + t]
 
-            window = torch.cat(
-                [history, current.unsqueeze(-1)], dim=-1
-            )
+            window = torch.cat([history, current.unsqueeze(-1)], dim=-1)
 
             value = (window * weight_cpu).sum(dim=-1)
             value = F.silu(value)

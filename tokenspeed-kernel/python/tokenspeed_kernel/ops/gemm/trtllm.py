@@ -47,9 +47,7 @@ def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
 
 _fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
 _fp4_dtypes: frozenset[torch.dtype] = frozenset(
-    {torch.uint8}
-    if _fp4_dtype is None
-    else {torch.uint8, _fp4_dtype}
+    {torch.uint8} if _fp4_dtype is None else {torch.uint8, _fp4_dtype}
 )
 _NVFP4_SCALE_DTYPES: frozenset[torch.dtype] = frozenset(
     {torch.float32, torch.uint8, torch.float8_e4m3fn}

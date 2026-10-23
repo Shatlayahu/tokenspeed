@@ -326,9 +326,7 @@ def _fused_gdn_decode_update_kernel(
                 other=-1,
             )
         else:
-            parents = _latest_ancestor(
-                tree_ancestors + i_n * T, nodes, nodes < T
-            )
+            parents = _latest_ancestor(tree_ancestors + i_n * T, nodes, nodes < T)
 
     b_A_log = tl.load(p_A_log).to(tl.float32)
     b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
@@ -349,21 +347,17 @@ def _fused_gdn_decode_update_kernel(
             b_a = n_a
 
             has_next = step_idx + 1 < T
-            n_q = tl.load(
-                p_q + Q_STRIDE_T, mask=mask_k & has_next, other=0
-            ).to(tl.float32)
-            n_k = tl.load(
-                p_k + K_STRIDE_T, mask=mask_k & has_next, other=0
-            ).to(tl.float32)
-            n_v = tl.load(
-                p_v + V_STRIDE_T, mask=mask_v & has_next, other=0
-            ).to(tl.float32)
-            n_b = tl.load(
-                p_b + B_STRIDE_T, mask=has_next, other=0
-            ).to(tl.float32)
-            n_a = tl.load(
-                p_a + A_STRIDE_T, mask=has_next, other=0
-            ).to(tl.float32)
+            n_q = tl.load(p_q + Q_STRIDE_T, mask=mask_k & has_next, other=0).to(
+                tl.float32
+            )
+            n_k = tl.load(p_k + K_STRIDE_T, mask=mask_k & has_next, other=0).to(
+                tl.float32
+            )
+            n_v = tl.load(p_v + V_STRIDE_T, mask=mask_v & has_next, other=0).to(
+                tl.float32
+            )
+            n_b = tl.load(p_b + B_STRIDE_T, mask=has_next, other=0).to(tl.float32)
+            n_a = tl.load(p_a + A_STRIDE_T, mask=has_next, other=0).to(tl.float32)
         else:
             b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
             b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -372,13 +366,9 @@ def _fused_gdn_decode_update_kernel(
             b_a = tl.load(p_a).to(tl.float32)
         if HAS_TREE:
             if PRECOMPUTED_PARENTS:
-                parent = tl.load(
-                    tree_ancestors + i_n * T + step_idx
-                )
+                parent = tl.load(tree_ancestors + i_n * T + step_idx)
             else:
-                parent = _latest_ancestor(
-                    tree_ancestors + i_n * T, step_idx, True
-                )
+                parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
             if parent != step_idx - 1:
                 # The parent's row was written by this program over the same tile.
                 if not PRECOMPUTED_PARENTS:
@@ -552,14 +542,11 @@ def _launch_fused_gdn_decode_update(
     # helper reliably. Precompute parent indices only for tree mode.
     kernel_tree_data = tree_ancestors
     precomputed_parents = (
-        current_platform().vendor == "ascend"
-        and tree_ancestors is not None
+        current_platform().vendor == "ascend" and tree_ancestors is not None
     )
     if precomputed_parents:
         ancestor_rows = (
-            tree_ancestors.detach()
-            .to(device="cpu", dtype=torch.int64)
-            .tolist()
+            tree_ancestors.detach().to(device="cpu", dtype=torch.int64).tolist()
         )
         parent_rows = []
         for row in ancestor_rows:
@@ -1028,9 +1015,7 @@ def triton_gdn_decode_mtp(
     """
     # Ascend FP32 state-scatter fallback: compute all token states
     # into scratch first, then scatter after the kernel has completed.
-    _state_destination = (
-        initial_state if output_state is None else output_state
-    )
+    _state_destination = initial_state if output_state is None else output_state
     if (
         current_platform().vendor == "ascend"
         and _state_destination.dtype == torch.float32
@@ -1069,9 +1054,7 @@ def triton_gdn_decode_mtp(
         )
 
         flat_indices = output_state_indices.reshape(-1)
-        flat_states = intermediate_states_buffer.reshape(
-            B * T, HV, V, K
-        )
+        flat_states = intermediate_states_buffer.reshape(B * T, HV, V, K)
         valid = flat_indices >= 0
         _state_destination.index_copy_(
             0,

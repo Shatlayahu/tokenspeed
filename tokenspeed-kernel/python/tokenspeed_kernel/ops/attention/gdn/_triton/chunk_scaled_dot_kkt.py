@@ -160,6 +160,8 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         (1, 0),
     )
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+
+
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -201,7 +203,9 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H, triton.cdiv(BT, 32) * triton.cdiv(BT, 32))](
+    chunk_scaled_dot_kkt_fwd_kernel[
+        (NT, B * H, triton.cdiv(BT, 32) * triton.cdiv(BT, 32))
+    ](
         k=k,
         beta=beta,
         g_cumsum=g_cumsum,

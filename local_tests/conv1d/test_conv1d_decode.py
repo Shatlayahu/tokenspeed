@@ -17,10 +17,7 @@ x = torch.randn(batch, dim, device=device, dtype=torch.float32)
 weight = torch.randn(dim, width, device=device, dtype=torch.float32)
 
 # 历史三个 token 的卷积输入
-conv_state = torch.randn(
-    batch, dim, width - 1,
-    device=device, dtype=torch.float32
-)
+conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=torch.float32)
 
 # 保存原始值，避免 in-place 修改影响参考计算
 x_original = x.clone()
@@ -32,9 +29,7 @@ window = torch.cat(
     dim=-1,
 )
 
-expected_output = (
-    window * weight.unsqueeze(0)
-).sum(dim=-1)
+expected_output = (window * weight.unsqueeze(0)).sum(dim=-1)
 
 expected_state = window[:, :, 1:].clone()
 

@@ -1,4 +1,3 @@
-
 import torch
 import torch_npu
 
@@ -10,22 +9,17 @@ DEVICE = "npu:0"
 def run_case(dtype, tokens, dim):
     torch.manual_seed(42)
 
-    norm = GemmaRMSNorm(dim, eps=1e-6).to(
-        device=DEVICE, dtype=dtype
-    )
+    norm = GemmaRMSNorm(dim, eps=1e-6).to(device=DEVICE, dtype=dtype)
 
     # 使用模型原有的权重加载函数，确保 gemma_weight 同步更新
     with torch.no_grad():
-        loaded_weight = (
-            torch.randn(dim, device=DEVICE, dtype=dtype) * 0.1
-        )
+        loaded_weight = torch.randn(dim, device=DEVICE, dtype=dtype) * 0.1
         norm._weight_loader(norm.weight, loaded_weight)
 
     # 验证预计算的 Gemma 权重是正确的
     weight_error = (
-        norm.gemma_weight.float()
-        - (norm.weight.float() + 1.0)
-    ).abs().max().item()
+        (norm.gemma_weight.float() - (norm.weight.float() + 1.0)).abs().max().item()
+    )
 
     print(
         f"gemma_weight max difference: {weight_error:.6f}",
@@ -39,9 +33,7 @@ def run_case(dtype, tokens, dim):
     wf = norm.weight.float()
 
     expected = (
-        xf
-        * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)
-        * (1.0 + wf)
+        xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6) * (1.0 + wf)
     ).to(dtype)
 
     actual = norm(x)
@@ -56,9 +48,7 @@ def run_case(dtype, tokens, dim):
         rtol=rtol,
     )
 
-    error = (
-        actual.float().cpu() - expected.float().cpu()
-    ).abs().max().item()
+    error = (actual.float().cpu() - expected.float().cpu()).abs().max().item()
 
     print(
         f"PASSED | dtype={dtype}, tokens={tokens}, "

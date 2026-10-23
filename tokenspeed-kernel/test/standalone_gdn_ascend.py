@@ -3,12 +3,10 @@
 import torch
 import torch.nn.functional as F
 import torch_npu  # noqa: F401
-
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_step,
 )
-
 
 DEVICE = torch.device("npu:0")
 DTYPE = torch.bfloat16
@@ -23,9 +21,7 @@ def check_close(name, actual, expected, *, atol=ATOL, rtol=RTOL):
     max_err = (actual - expected).abs().max().item()
     print(f"{name}: max_abs_error={max_err:.8g}", flush=True)
 
-    torch.testing.assert_close(
-        actual, expected, atol=atol, rtol=rtol, msg=name
-    )
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=name)
 
 
 def l2norm_reference(x):
@@ -33,9 +29,7 @@ def l2norm_reference(x):
     x_float = x.float()
     return (
         x_float
-        * torch.rsqrt(
-            x_float.square().sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        )
+        * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(1e-6))
     ).to(x.dtype)
 
 
@@ -74,9 +68,7 @@ def torch_prefill_reference(q, k, v, g, beta, initial_state, cu_seqlens, scale):
                 v_t = vf[0, t, hv]
 
                 state_h = torch.exp(gf[0, t, hv]) * state_seq[hv]
-                delta = betaf[0, t, hv] * (
-                    v_t - k_t @ state_h
-                )
+                delta = betaf[0, t, hv] * (v_t - k_t @ state_h)
                 state_h = state_h + k_t[:, None] * delta[None, :]
 
                 out[0, t, hv] = scale * (q_t @ state_h)
@@ -84,11 +76,7 @@ def torch_prefill_reference(q, k, v, g, beta, initial_state, cu_seqlens, scale):
 
         final_states.append(state_seq.clone())
 
-    final_state = (
-        torch.stack(final_states)
-        .transpose(-2, -1)
-        .to(initial_state.dtype)
-    )
+    final_state = torch.stack(final_states).transpose(-2, -1).to(initial_state.dtype)
     return out.to(q.dtype), final_state
 
 
@@ -101,33 +89,49 @@ def test_gdn_prefill():
     num_q_heads = 16
     num_v_heads = 32
     head_dim = 128
-    scale = head_dim ** -0.5
+    scale = head_dim**-0.5
 
     q = torch.randn(
-        1, seq_len, num_q_heads, head_dim,
-        device=DEVICE, dtype=DTYPE,
+        1,
+        seq_len,
+        num_q_heads,
+        head_dim,
+        device=DEVICE,
+        dtype=DTYPE,
     )
     k = torch.randn_like(q)
-    v = torch.randn(
-        1, seq_len, num_v_heads, head_dim,
-        device=DEVICE, dtype=DTYPE,
-    ) * 0.5
-    g = F.logsigmoid(
-        torch.randn(1, seq_len, num_v_heads, device=DEVICE)
+    v = (
+        torch.randn(
+            1,
+            seq_len,
+            num_v_heads,
+            head_dim,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.5
     )
-    beta = torch.rand(
-        1, seq_len, num_v_heads, device=DEVICE, dtype=DTYPE
-    ).sigmoid()
-    initial_state = torch.randn(
-        1, num_v_heads, head_dim, head_dim,
-        device=DEVICE, dtype=DTYPE,
-    ) * 0.01
-    cu_seqlens = torch.tensor(
-        [0, seq_len], device=DEVICE, dtype=torch.int32
+    g = F.logsigmoid(torch.randn(1, seq_len, num_v_heads, device=DEVICE))
+    beta = torch.rand(1, seq_len, num_v_heads, device=DEVICE, dtype=DTYPE).sigmoid()
+    initial_state = (
+        torch.randn(
+            1,
+            num_v_heads,
+            head_dim,
+            head_dim,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.01
     )
+    cu_seqlens = torch.tensor([0, seq_len], device=DEVICE, dtype=torch.int32)
 
     result = gdn_chunk_prefill(
-        q, k, v, g, beta,
+        q,
+        k,
+        v,
+        g,
+        beta,
         scale=scale,
         initial_state=initial_state.clone(),
         cu_seqlens=cu_seqlens,
@@ -167,9 +171,7 @@ def test_gdn_prefill():
     print("PASS: GDN Prefill output and final state.", flush=True)
 
 
-def torch_decode_reference(
-    q, k, v, a, b, A_log, dt_bias, initial_state, scale
-):
+def torch_decode_reference(q, k, v, a, b, A_log, dt_bias, initial_state, scale):
     """Independent sequential recurrent-decode reference on CPU."""
     qf, kf, vf = q.float(), k.float(), v.float()
     af, bf = a.float(), b.float()
@@ -183,7 +185,10 @@ def torch_decode_reference(
     # K-last pool rows: [B, HV, V, K].
     state = initial_state.float().transpose(-2, -1).clone()
     out = torch.zeros(
-        batch, steps, num_v_heads, v.shape[-1],
+        batch,
+        steps,
+        num_v_heads,
+        v.shape[-1],
         dtype=torch.float32,
         device="cpu",
     )
@@ -191,9 +196,7 @@ def torch_decode_reference(
 
     for t in range(steps):
         x = af[:, t] + dt_bias
-        softplus_x = torch.where(
-            x <= 20.0, torch.log1p(torch.exp(x)), x
-        )
+        softplus_x = torch.where(x <= 20.0, torch.log1p(torch.exp(x)), x)
         g = -torch.exp(A_log) * softplus_x
         beta = torch.sigmoid(bf[:, t])
 
@@ -207,9 +210,7 @@ def torch_decode_reference(
                 kn = k_t / torch.sqrt((k_t * k_t).sum() + 1e-6)
 
                 state_h = state[bi, hv] * torch.exp(g[bi, hv])
-                delta = beta[bi, hv] * (
-                    vf[bi, t, hv] - kn @ state_h
-                )
+                delta = beta[bi, hv] * (vf[bi, t, hv] - kn @ state_h)
                 state_h = state_h + kn[:, None] * delta[None, :]
 
                 out[bi, t, hv] = scale * (qn @ state_h)
@@ -233,34 +234,46 @@ def test_gdn_recurrent_decode(state_dtype):
     num_v_heads = 8
     head_dim = 128
     pool_size = 16
-    scale = head_dim ** -0.5
+    scale = head_dim**-0.5
 
     q = torch.randn(
-        batch, steps, num_q_heads, head_dim,
-        device=DEVICE, dtype=DTYPE,
+        batch,
+        steps,
+        num_q_heads,
+        head_dim,
+        device=DEVICE,
+        dtype=DTYPE,
     )
     k = torch.randn_like(q)
-    v = torch.randn(
-        batch, steps, num_v_heads, head_dim,
-        device=DEVICE, dtype=DTYPE,
-    ) * 0.5
-    a = torch.randn(
-        batch, steps, num_v_heads, device=DEVICE, dtype=torch.float32
+    v = (
+        torch.randn(
+            batch,
+            steps,
+            num_v_heads,
+            head_dim,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+        * 0.5
     )
+    a = torch.randn(batch, steps, num_v_heads, device=DEVICE, dtype=torch.float32)
     b = torch.randn_like(a)
     A_log = torch.randn(num_v_heads, device=DEVICE, dtype=torch.float32)
-    dt_bias = torch.randn(
-        num_v_heads, device=DEVICE, dtype=torch.float32
-    )
+    dt_bias = torch.randn(num_v_heads, device=DEVICE, dtype=torch.float32)
 
-    pool = torch.randn(
-        pool_size, num_v_heads, head_dim, head_dim,
-        device=DEVICE, dtype=state_dtype,
-    ) * 0.02
-    original_pool = pool.clone()
-    read_idx = torch.tensor(
-        [1, 3, 5, 7], device=DEVICE, dtype=torch.int32
+    pool = (
+        torch.randn(
+            pool_size,
+            num_v_heads,
+            head_dim,
+            head_dim,
+            device=DEVICE,
+            dtype=state_dtype,
+        )
+        * 0.02
     )
+    original_pool = pool.clone()
+    read_idx = torch.tensor([1, 3, 5, 7], device=DEVICE, dtype=torch.int32)
     scale = float(scale)
 
     ref_out, ref_states = torch_decode_reference(
@@ -282,13 +295,13 @@ def test_gdn_recurrent_decode(state_dtype):
 
     for t in range(steps):
         out_t = gdn_decode_step(
-            q[:, t:t + 1].contiguous(),
-            k[:, t:t + 1].contiguous(),
-            v[:, t:t + 1].contiguous(),
+            q[:, t : t + 1].contiguous(),
+            k[:, t : t + 1].contiguous(),
+            v[:, t : t + 1].contiguous(),
             A_log=A_log,
-            a=a[:, t:t + 1].contiguous(),
+            a=a[:, t : t + 1].contiguous(),
             dt_bias=dt_bias,
-            b=b[:, t:t + 1].contiguous(),
+            b=b[:, t : t + 1].contiguous(),
             initial_state=pool,
             initial_state_indices=read_idx,
             scale=scale,
@@ -299,22 +312,16 @@ def test_gdn_recurrent_decode(state_dtype):
 
         actual_out = out_t[:, 0].float().cpu()
         expected_out = ref_out[:, t]
-        torch.testing.assert_close(
-            actual_out, expected_out, rtol=RTOL, atol=ATOL
-        )
+        torch.testing.assert_close(actual_out, expected_out, rtol=RTOL, atol=ATOL)
 
         output_error = (actual_out - expected_out).abs().max().item()
         max_output_error = max(max_output_error, output_error)
 
         actual_state = pool[read_idx].float().cpu()
         expected_state = ref_states[t].to(state_dtype).float()
-        torch.testing.assert_close(
-            actual_state, expected_state, rtol=RTOL, atol=3e-2
-        )
+        torch.testing.assert_close(actual_state, expected_state, rtol=RTOL, atol=3e-2)
 
-        state_error = (
-            actual_state - expected_state
-        ).abs().max().item()
+        state_error = (actual_state - expected_state).abs().max().item()
         max_state_error = max(max_state_error, state_error)
 
     # The decode kernel must not change pool rows it never reads or writes.
@@ -328,7 +335,6 @@ def test_gdn_recurrent_decode(state_dtype):
     print(f"Maximum output error: {max_output_error:.8g}", flush=True)
     print(f"Maximum state error: {max_state_error:.8g}", flush=True)
     print("PASS: GDN recurrent decode.", flush=True)
-
 
 
 def main():

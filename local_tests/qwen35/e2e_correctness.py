@@ -9,7 +9,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
-
 from common import correctness_workloads, workload_dict, write_json
 
 

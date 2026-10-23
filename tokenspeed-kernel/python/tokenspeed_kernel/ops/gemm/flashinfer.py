@@ -57,9 +57,7 @@ if platform.is_nvidia:
 
 _fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
 _fp4_dtypes: frozenset[torch.dtype] = frozenset(
-    {torch.uint8}
-    if _fp4_dtype is None
-    else {torch.uint8, _fp4_dtype}
+    {torch.uint8} if _fp4_dtype is None else {torch.uint8, _fp4_dtype}
 )
 _MXFP8_SCALE = ScaleFormat(
     storage_dtype=torch.float32,

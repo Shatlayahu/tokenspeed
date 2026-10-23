@@ -33,9 +33,11 @@ def reference_rope(x, positions, cos_sin_cache, rotary_dim, head_dim):
 
     result = rotated_part * cos + rotated_half * sin
 
-    return torch.cat(
-        (result, unchanged_part), dim=-1
-    ).reshape(tokens, heads * head_dim).to(x.dtype)
+    return (
+        torch.cat((result, unchanged_part), dim=-1)
+        .reshape(tokens, heads * head_dim)
+        .to(x.dtype)
+    )
 
 
 def run_case(dtype, factor, tokens):
@@ -59,25 +61,13 @@ def run_case(dtype, factor, tokens):
         partial_rotary_factor=factor,
     ).to(DEVICE)
 
-    positions = torch.arange(
-        5, 5 + tokens, dtype=torch.int64, device=DEVICE
-    )
+    positions = torch.arange(5, 5 + tokens, dtype=torch.int64, device=DEVICE)
 
-    q = torch.randn(
-        tokens, q_heads * head_dim,
-        dtype=dtype, device=DEVICE
-    )
-    k = torch.randn(
-        tokens, kv_heads * head_dim,
-        dtype=dtype, device=DEVICE
-    )
+    q = torch.randn(tokens, q_heads * head_dim, dtype=dtype, device=DEVICE)
+    k = torch.randn(tokens, kv_heads * head_dim, dtype=dtype, device=DEVICE)
 
-    expected_q = reference_rope(
-        q, positions, rope.cos_sin_cache, rotary_dim, head_dim
-    )
-    expected_k = reference_rope(
-        k, positions, rope.cos_sin_cache, rotary_dim, head_dim
-    )
+    expected_q = reference_rope(q, positions, rope.cos_sin_cache, rotary_dim, head_dim)
+    expected_k = reference_rope(k, positions, rope.cos_sin_cache, rotary_dim, head_dim)
 
     actual_q, actual_k = rope(positions, q.clone(), k.clone())
     torch.npu.synchronize()
@@ -85,12 +75,16 @@ def run_case(dtype, factor, tokens):
     atol = rtol = 0.03 if dtype == torch.bfloat16 else 1e-4
 
     torch.testing.assert_close(
-        actual_q.float().cpu(), expected_q.float().cpu(),
-        atol=atol, rtol=rtol,
+        actual_q.float().cpu(),
+        expected_q.float().cpu(),
+        atol=atol,
+        rtol=rtol,
     )
     torch.testing.assert_close(
-        actual_k.float().cpu(), expected_k.float().cpu(),
-        atol=atol, rtol=rtol,
+        actual_k.float().cpu(),
+        expected_k.float().cpu(),
+        atol=atol,
+        rtol=rtol,
     )
 
     # The non-rotary dimensions must remain unchanged.
@@ -104,12 +98,11 @@ def run_case(dtype, factor, tokens):
             torch.testing.assert_close(
                 a[..., rotary_dim:].cpu(),
                 b[..., rotary_dim:].cpu(),
-                atol=0, rtol=0,
+                atol=0,
+                rtol=0,
             )
 
-    err_q = (
-        actual_q.float().cpu() - expected_q.float().cpu()
-    ).abs().max().item()
+    err_q = (actual_q.float().cpu() - expected_q.float().cpu()).abs().max().item()
 
     print(
         f"PASSED | dtype={dtype}, factor={factor}, "
