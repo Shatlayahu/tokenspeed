@@ -13,11 +13,42 @@
 
 ## 1. 成员分工与贡献
 
-| 成员 | 主要贡献 |
-|---|---|
-| `lilyChang409` | GDN chunk Prefill、recurrent Decode、recurrent state 数值验证与独立测试 |
-| `Shatlayahu` | Causal Conv1D、QK Norm、RoPE、Attention Gate、MHA 兼容性与算子测试 |
-| `shaofeiliu04` | 合并两个计算分支；搭建 TokenSpeed/Ascend 环境；修复模型注册、NPU device context、RMSNorm 和 D=256 MHA；完成真实权重加载、服务启动、HF 参考、端到端/请求隔离测试、性能与组件微基准，并整理本报告 |
+### 成员 A（`lilyChang409`）：Gated DeltaNet 适配
+
+负责 18 个 Linear Attention Layers 中的核心计算：
+
+- 梳理 `Qwen3_5GatedDeltaNet` 的调用链；
+- 适配 GDN Prefill Kernel；
+- 适配 GDN Recurrent Decode Kernel；
+- 验证 recurrent state 的数值正确性；
+- 编写 GDN 的独立测试。
+
+交付：能在 Ascend 上运行的 GDN 算子及测试。
+
+### 成员 B（`Shatlayahu`）：Conv1D + Attention 适配
+
+负责卷积计算、状态更新，以及 Full Attention 的兼容性：
+
+- 适配 Causal Conv1D Prefill；
+- 适配 Causal Conv1D Decode / State Update；
+- 验证现有 Ascend MHA 能否用于 Qwen3.5；
+- 检查 QK Norm、RoPE、Attention Gate；
+- 编写 Conv1D 及完整 Attention Layer 测试。
+
+交付：能在 Ascend 上运行的 Conv1D，以及 Qwen3.5 Attention 验证结果。
+
+### 成员 C（`shaofeiliu04`）：模型集成 + End-to-End 测试
+
+负责把成员 A、B 的计算模块组合成完整推理系统：
+
+- Qwen3.5-0.8B 权重下载与加载；
+- 处理模型注册、NPU device、运行时依赖；
+- 检查 FFN、Embedding、LM Head；
+- 建立 Hugging Face 参考输出；
+- 集成 Prefill / Decode，测试完整文本生成；
+- 记录 TTFT、Decode latency、HBM 占用。
+
+交付：可运行的模型启动脚本、端到端正确性测试和性能基线。
 
 ## 2. 环境与模型配置
 
@@ -315,24 +346,3 @@ python local_tests/qwen35/profile_prefill_components.py \
 python local_tests/qwen35/profile_prefill_attention.py \
   --warmups 3 --repeats 10
 ```
-
-## 10. 结论与后续优化
-
-本阶段已经实现 Qwen3.5-0.8B 在单个 Ascend 910C chip 上的完整文本推理，关键
-算子、recurrent state、请求隔离和端到端输出均通过验证，并建立了可重复的
-TTFT、Decode latency 和 HBM 基线。
-
-作业要求中的四个问题回答如下：
-
-1. **直接复用与修改内容：**复用 TokenSpeed 模型/调度框架和已有 Ascend kernels；
-   修改 NPU device dispatch、RMSNorm、D=256 MHA，并集成 GDN/Conv1D。
-2. **最大适配障碍：**CUDA 假设与 CANN D=256 限制；分别通过 device-module
-   dispatch 和 NPU math fallback 解决。
-3. **状态正确性证明：**Prefill final state、16 步 Decode state 对 CPU reference
-   数值对照，并通过 A→B→A 请求隔离验证生命周期。
-4. **当前最值得优化的环节：**GDN Prefill core；1031-token 组件微基准为
-   41.811 ms/层，18 层诊断估计约 752.6 ms，是模型 TTFT 的主要组成。
-
-后续优化顺序为：先优化/融合 GDN chunk Prefill，减少 recurrent state 的读写与
-kernel 开销；再实现 D=256 fused Attention Prefill；最后重新测量端到端 TTFT，
-以相同权重、输入和 3×10 配置进行优化前后对照。
