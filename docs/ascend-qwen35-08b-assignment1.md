@@ -1,4 +1,4 @@
-# 作业 1：Qwen3.5-0.8B Ascend 单 Chip 模型适配与正确性
+# 作业 1：Qwen3.5-0.8B Ascend 单 Chip 模型适配、正确性与性能基线
 
 ## 摘要
 
@@ -13,42 +13,11 @@
 
 ## 1. 成员分工与贡献
 
-### 成员 A（`lilyChang409`）：Gated DeltaNet 适配
-
-负责 18 个 Linear Attention Layers 中的核心计算：
-
-- 梳理 `Qwen3_5GatedDeltaNet` 的调用链；
-- 适配 GDN Prefill Kernel；
-- 适配 GDN Recurrent Decode Kernel；
-- 验证 recurrent state 的数值正确性；
-- 编写 GDN 的独立测试。
-
-交付：能在 Ascend 上运行的 GDN 算子及测试。
-
-### 成员 B（`Shatlayahu`）：Conv1D + Attention 适配
-
-负责卷积计算、状态更新，以及 Full Attention 的兼容性：
-
-- 适配 Causal Conv1D Prefill；
-- 适配 Causal Conv1D Decode / State Update；
-- 验证现有 Ascend MHA 能否用于 Qwen3.5；
-- 检查 QK Norm、RoPE、Attention Gate；
-- 编写 Conv1D 及完整 Attention Layer 测试。
-
-交付：能在 Ascend 上运行的 Conv1D，以及 Qwen3.5 Attention 验证结果。
-
-### 成员 C（`shaofeiliu04`）：模型集成 + End-to-End 测试
-
-负责把成员 A、B 的计算模块组合成完整推理系统：
-
-- Qwen3.5-0.8B 权重下载与加载；
-- 处理模型注册、NPU device、运行时依赖；
-- 检查 FFN、Embedding、LM Head；
-- 建立 Hugging Face 参考输出；
-- 集成 Prefill / Decode，测试完整文本生成；
-- 记录 TTFT、Decode latency、HBM 占用。
-
-交付：可运行的模型启动脚本、端到端正确性测试和性能基线。
+| 成员 | 分工 | 具体工作 | 交付内容 |
+|---|---|---|---|
+| 成员 A（`lilyChang409`） | Gated DeltaNet 适配，负责 18 个 Linear Attention Layer 的核心计算 | 梳理 `Qwen3_5GatedDeltaNet` 调用链；适配 GDN Prefill 和 recurrent Decode kernel；验证 recurrent state 的数值正确性；编写 GDN 独立测试 | 可在 Ascend 上运行的 GDN 算子及测试 |
+| 成员 B（`Shatlayahu`） | Conv1D 与 Attention 适配，负责卷积计算、状态更新和 Full Attention 兼容性 | 适配 Causal Conv1D Prefill、Decode 和 state update；验证现有 Ascend MHA 对 Qwen3.5 的适用性；检查 QK Norm、RoPE 和 Attention Gate；编写 Conv1D 与完整 Attention Layer 测试 | 可在 Ascend 上运行的 Conv1D，以及 Qwen3.5 Attention 验证结果 |
+| 成员 C（`shaofeiliu04`） | 模型集成与端到端测试，负责将成员 A、B 的模块组合为完整推理系统 | 下载并加载 Qwen3.5-0.8B 权重；处理模型注册、NPU device 和运行时依赖；检查 FFN、Embedding 和 LM Head；建立 Hugging Face 参考输出；集成 Prefill/Decode 并验证完整文本生成；记录 TTFT、Decode latency 和 HBM 占用 | 可运行的模型启动脚本、端到端正确性测试和性能基线 |
 
 ## 2. 环境与模型配置
 
@@ -120,6 +89,12 @@ Ascend RMSNorm、RoPE、KV cache 和融合注意力路径，新增或修正了�
    OpenAI-compatible 服务入口。
 6. 服务使用 `--language-model-only`，跳过本阶段不要求的视觉编码器。
 
+权重从服务器本地模型目录以 safetensors 形式离线加载。模型注册后，TokenSpeed
+根据 Qwen3.5 配置构建 24 层文本模型；`load_weights` 将 checkpoint 中分离的
+Q/K/V、gate/up 等权重映射到运行时的 packed projection 参数，并使用专用 loader
+处理 Conv1D、`A_log` 和 `dt_bias`。服务启动日志确认权重加载完成，权重占用约
+1.46 GB；随后四组真实权重端到端结果均与参考端一致。
+
 最大的适配障碍是 CUDA 假设散落在模型初始化和 norm 路径中，以及 CANN fused
 attention 对 D=256 的限制。前者通过 device-module dispatch 解决；后者保留
 NPU tensor，使用 NPU 上的 FP32 QK、causal mask、softmax 和 BF16 PV fallback，
@@ -183,7 +158,7 @@ Prefill final state 与逐 token CPU reference 对照；Decode 对 FP32/BF16 sta
 | Causal Conv1D | `[B,C,T]`，kernel=4 | FP32/BF16 | Ascend/Triton | 支持 | Decode、10 步 state、36 组 Prefill 边界形状 |
 | GDN Prefill | Q/K/V head dim 128 | BF16，state FP32/BF16 | Ascend Triton | 支持 | CPU 逐 token reference，output/final state |
 | GDN Decode | state `[B,H_v,V,K]` | BF16，state FP32/BF16 | Ascend Triton | 支持 | 连续 16 步逐步 state 对照 |
-| QK Norm / partial RoPE | rotary factor 0.25 | FP32/BF16 | Ascend kernel | 支持 | token=1/7、factor=0.25/0.5/1.0，共 12 组 |
+| QK Norm / partial RoPE | rotary factor 0.25 | FP32/BF16 | Ascend kernel | 支持 | 8 组 GQA prologue；token=1/7、factor=0.25/0.5/1.0 的 12 组 RoPE |
 | MHA Prefill | Q `[T,8,256]`，KV `[T,2,256]` | BF16/FP32 accumulate | NPU fallback | 正确，待优化 | 变长 GQA 与 FP32 reference，含 D=256 |
 | MHA Decode | paged KV cache | BF16 | CANN fused op | 支持 | paged Decode 和 graph state 更新 |
 | Attention Gate | `[T,8,256]` | FP32/BF16 | Ascend Triton | 支持 | token=1/7，2D/3D stride，共 8 组 |
@@ -197,18 +172,27 @@ GDN 的多步 Prefill→Decode 和不同 state dtype。
 
 ### 5.1 误差判据与结果
 
-FP32 reference 用于公式正确性；模型运行使用 BF16。BF16 测试通常采用
-`atol=rtol=2e-2`，recurrent state 与 grouped/gated norm 放宽至 `3e-2`。
-依据是 BF16 仅有 7-bit fraction，矩阵乘和 recurrent update 会累积舍入误差；
-阈值仍明显小于随机输入的典型幅值。无需不同硬件逐位相同。
+FP32 reference 用于公式正确性，模型运行使用 BF16。误差阈值按计算链长度设置：
+FP32 Conv1D 为 `atol=rtol=1e-4`；GDN BF16 output 为 `2e-2`，recurrent state
+为 `3e-2`；BF16 Conv1D Prefill/Prefill→Decode 为 `5e-2`，10 步独立 Decode
+为 `1e-1`；完整 gated Attention 为 `6e-2`。Conv1D state 在参考结果转为目标
+dtype 后要求逐元素相同。阈值差异来自 BF16 仅有 7-bit fraction，卷积、矩阵乘、
+gate 和 recurrent update 的舍入误差会沿多步计算累积；因此不要求不同硬件逐位
+相同，但所有结果必须落在预先设定的模块阈值内。
 
 关键实测结果：
 
 - GDN Prefill output 最大误差 `2.44e-4`；
 - GDN Prefill final state 最大误差 `1.64e-3`；
 - BF16 recurrent Decode 最大 state 误差 `3.91e-3`；
-- Gated Attention 三步 Decode 最大误差 `3.91e-3`；
-- 所有 Conv1D、GDN、MHA、RoPE、QK Norm、gate、KV write 和 norm 测试通过。
+- Causal Conv1D 的 36 组 Prefill、6 组 Prefill→Decode 和 6 组十步 Decode
+  用例全部通过；前两类用例日志中的最大误差为 `0`，十步 Decode 均在预设阈值内；
+- Gated Attention Prefill 最大误差 `7.812e-3`，三步 Decode 最大误差
+  `3.906e-3`；
+- Gemma RMSNorm BF16 最大误差 `1.5625e-2`，GQA prologue 最大误差
+  `3.125e-2`，partial RoPE 最大误差 `1.5625e-2`，Attention Gate 最大误差
+  `1.953e-3`；
+- 5 组 MHA、KV cache write、gated/add RMSNorm 以及上述全部测试均通过。
 
 ## 6. 端到端正确性
 
@@ -223,8 +207,8 @@ tokenizer 和最大生成长度。
 | 英文指令 | 22 | `BLUE` | `BLUE` | 完全一致 |
 | 长上下文抽取 | 1794 | `ASCEND-910C-27` | `ASCEND-910C-27` | 完全一致 |
 
-状态隔离测试执行 A（数学）→B（长上下文）→A（数学）。两次 A 的 greedy 输出
-完全一致，且 JSON 中 `request_isolation.passed=true`，说明 recurrent state 没有
+状态隔离测试执行 A（简单数学）→B（中文事实）→A（简单数学）。两次 A 的
+greedy 输出均为 `1 加 1 等于 2。`，测试结果为通过，说明 recurrent state 没有
 跨请求泄漏。
 
 ## 7. 性能基线
@@ -234,22 +218,23 @@ tokenizer 和最大生成长度。
 - 关闭 prefix caching 和 KVStore，避免缓存命中缩短 Prefill；
 - temperature 0，`ignore_eos=true`，固定生成 32/128 token；
 - 输入目标长度为 32/1024 token，加入 chat template 后实际为 39/1031 token；
-- 每组预热 3 次，正式测量 10 次，报告 P50；
+- 每组预热 3 次，正式测量 10 次，报告 P50 和 P95；
 - TTFT 为请求发出至第一个 streaming token 到达；
 - Decode latency 为第一个 token 后其余 token 的平均间隔；
 - HBM 每 0.5 s 通过 `npu-smi` 采样。
 
 ### 7.2 结果
 
-| 输入 token | 输出 token | TTFT P50 (s) | Decode P50 (s/token) | E2E P50 (s) | 物理 chip 峰值 HBM (MB) |
+| 输入 token | 输出 token | TTFT P50/P95 (s) | Decode P50/P95 (s/token) | E2E P50/P95 (s) | 物理 chip 峰值 HBM (MB) |
 |---:|---:|---:|---:|---:|---:|
-| 39 | 32 | 0.1600 | 0.0423 | 1.4716 | 29913 |
-| 39 | 128 | 0.1218 | 0.0417 | 5.8686 | 29978 |
-| 1031 | 32 | 1.1987 | 0.0420 | 2.6668 | 29914 |
-| 1031 | 128 | 1.2320 | 0.0407 | 6.8252 | 29914 |
+| 39 | 32 | 0.1600 / 0.1614 | 0.0423 / 0.0426 | 1.4716 / 1.4825 | 29913 |
+| 39 | 128 | 0.1218 / 0.1239 | 0.0417 / 0.0422 | 5.8686 / 5.9415 | 29978 |
+| 1031 | 32 | 1.1987 / 1.2012 | 0.0420 / 0.0424 | 2.6668 / 2.7048 | 29914 |
+| 1031 | 128 | 1.2320 / 1.3636 | 0.0407 / 0.0423 | 6.8252 / 7.4421 | 29914 |
 
-本次服务器为共享环境，物理 chip HBM 包含其他常驻进程，因此它不能直接解释为
-本模型独占量。TokenSpeed 启动日志给出的本进程口径更稳定：权重约 1.46 GB，
+本次测量开始前的物理 chip HBM 基线为 29913 MB。服务器为共享环境，物理 HBM
+还包含其他常驻进程，因此峰值不能直接解释为本模型独占量。TokenSpeed 启动日志
+给出的本进程口径更稳定：权重约 1.46 GB，
 KV cache 15.63 GB，Torch allocated 17.35 GB，driver view 22.98 GB。报告同时保留
 物理总量和进程口径，避免把共享进程内存误归因于本模型。
 
