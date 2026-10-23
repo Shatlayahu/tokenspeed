@@ -232,19 +232,26 @@ KV cache 15.63 GB，Torch allocated 17.35 GB，driver view 22.98 GB。报告同�
 
 ### 8.2 代表性组件微基准
 
-所有组件在 NPU BF16 上预热 3 次、测量 10 次。下表为 1031-token P50；
-“层数×P50”只用于诊断，不是完整 trace 的精确加和，它未包含 norm、cache write、
-框架开销和可能的 kernel overlap。
+所有组件在 NPU BF16 上预热 3 次、测量 10 次。下表同时给出短、长输入的
+P50/P95。“层数×P50”只用于诊断，不是完整 trace 的精确加和，它未包含 norm、
+cache write、框架开销和可能的 kernel overlap。
 
-| 组件 | 层数 | P50/层 (ms) | 层数×P50 (ms) |
-|---|---:|---:|---:|
-| GDN input projection | 18 | 0.1474 | 2.65 |
-| GDN Prefill core | 18 | 41.8110 | 752.60 |
-| GDN output projection | 18 | 0.0772 | 1.39 |
-| FFN gate/up projection | 24 | 0.1262 | 3.03 |
-| FFN SiLU×up | 24 | 0.0711 | 1.71 |
-| FFN down projection | 24 | 0.0915 | 2.20 |
-| Full Attention core | 6 | 0.5967 | 3.58 |
+| Tokens | 组件 | 层数 | P50/层 (ms) | P95/层 (ms) | 层数×P50 (ms) |
+|---:|---|---:|---:|---:|---:|
+| 39 | GDN input projection | 18 | 0.0609 | 0.1594 | 1.10 |
+| 39 | GDN Prefill core | 18 | 3.3240 | 3.4008 | 59.83 |
+| 39 | GDN output projection | 18 | 0.0491 | 0.0662 | 0.88 |
+| 39 | FFN gate/up projection | 24 | 0.0511 | 0.0673 | 1.23 |
+| 39 | FFN SiLU×up | 24 | 0.0665 | 0.1261 | 1.60 |
+| 39 | FFN down projection | 24 | 0.0586 | 0.0722 | 1.41 |
+| 39 | Full Attention core | 6 | 0.2289 | 0.3364 | 1.37 |
+| 1031 | GDN input projection | 18 | 0.1474 | 0.1744 | 2.65 |
+| 1031 | GDN Prefill core | 18 | 41.8110 | 44.3250 | 752.60 |
+| 1031 | GDN output projection | 18 | 0.0772 | 0.0942 | 1.39 |
+| 1031 | FFN gate/up projection | 24 | 0.1262 | 0.1309 | 3.03 |
+| 1031 | FFN SiLU×up | 24 | 0.0711 | 0.0799 | 1.71 |
+| 1031 | FFN down projection | 24 | 0.0915 | 0.0982 | 2.20 |
+| 1031 | Full Attention core | 6 | 0.5967 | 0.6043 | 3.58 |
 
 GDN core 的诊断估计约 752.6 ms，占 1031-token TTFT 的约 61%--63%，并且从
 39-token 的 3.324 ms/层增长到 1031-token 的 41.811 ms/层。这是隔离 NPU
@@ -256,7 +263,16 @@ kernel 后仍存在的耗时，不是 HTTP、tokenizer 或主机调度造成。G
 
 D=256 fallback 在 1031 token 时为 0.5762 ms/层；作为支持路径对照，D=128
 CANN fused op 为 0.1664 ms/层。二者 head dimension 不同，不能当作严格同形状
-加速比，但说明缺少 D=256 fusion 确有局部代价。fallback 分阶段结果为：
+加速比，但说明缺少 D=256 fusion 确有局部代价。完整算子结果为：
+
+| Tokens | Head dim | 路径 | P50 (ms) | P95 (ms) |
+|---:|---:|---|---:|---:|
+| 39 | 128 | fused | 0.1326 | 0.2543 |
+| 39 | 256 | fallback | 0.2243 | 0.9077 |
+| 1031 | 128 | fused | 0.1664 | 0.1708 |
+| 1031 | 256 | fallback | 0.5762 | 0.5839 |
+
+D=256 fallback 分阶段结果为：
 
 | Tokens | Layout/repeat (ms) | QK+mask+softmax (ms) | PV (ms) | QK 阶段占比 | Score matrix |
 |---:|---:|---:|---:|---:|---:|
@@ -300,21 +316,6 @@ python local_tests/qwen35/profile_prefill_attention.py \
   --warmups 3 --repeats 10
 ```
 
-结果目录包含：
-
-- `e2e_correctness.json`：逐用例输出、HF 对照和请求隔离；
-- `benchmark/benchmark.json`：原始样本与配置；
-- `benchmark/benchmark.csv`：表格数据；
-- `benchmark/benchmark.md`：性能汇总；
-- `prefill_components/`：GDN、FFN、Attention 代表性组件微基准；
-- `prefill_profile/`：D=256 Attention 路径和阶段分解。
-
-仓库同时保存了便于检查的 Markdown 汇总：
-
-- [3×10 性能基线](results/assignment1/benchmark-3x10.md)；
-- [Prefill 组件微基准](results/assignment1/prefill-components.md)；
-- [Full Attention Prefill 分解](results/assignment1/prefill-attention-profile.md)。
-
 ## 10. 结论与后续优化
 
 本阶段已经实现 Qwen3.5-0.8B 在单个 Ascend 910C chip 上的完整文本推理，关键
@@ -335,10 +336,3 @@ TTFT、Decode latency 和 HBM 基线。
 后续优化顺序为：先优化/融合 GDN chunk Prefill，减少 recurrent state 的读写与
 kernel 开销；再实现 D=256 fused Attention Prefill；最后重新测量端到端 TTFT，
 以相同权重、输入和 3×10 配置进行优化前后对照。
-
-## 11. AI 工具使用说明
-
-本阶段使用 Codex 辅助代码检索、环境故障定位、测试脚本搭建、日志汇总和报告
-结构整理。所有代码修改均由成员结合 TokenSpeed 调用链复核，并在真实 Ascend
-910C 上通过算子测试、HF 对照、端到端推理和性能实验验证；报告中的结论以实际
-日志和可复现脚本为依据。
