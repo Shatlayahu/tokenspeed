@@ -869,8 +869,11 @@ def gdn_replay_commit_supported(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
+
+if not current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.ascend  # noqa: E402,F401
 
 # isort: on
 

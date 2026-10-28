@@ -155,7 +155,34 @@ def _latest_ancestor(ancestors_row, step, valid):
     above = tl.load(ancestors_row + step, mask=valid, other=0) & (
         (tl.full([], 1, tl.int64) << step.to(tl.int64)) - 1
     )
-    return 63 - libdevice.clz(above)
+    # Portable highest-set-bit calculation; avoids CUDA-only clz.
+    x = above
+    msb = tl.full([], 0, tl.int32)
+
+    test = (x >> 32) > 0
+    msb = msb + tl.where(test, 32, 0)
+    x = tl.where(test, x >> 32, x)
+
+    test = (x >> 16) > 0
+    msb = msb + tl.where(test, 16, 0)
+    x = tl.where(test, x >> 16, x)
+
+    test = (x >> 8) > 0
+    msb = msb + tl.where(test, 8, 0)
+    x = tl.where(test, x >> 8, x)
+
+    test = (x >> 4) > 0
+    msb = msb + tl.where(test, 4, 0)
+    x = tl.where(test, x >> 4, x)
+
+    test = (x >> 2) > 0
+    msb = msb + tl.where(test, 2, 0)
+    x = tl.where(test, x >> 2, x)
+
+    test = (x >> 1) > 0
+    msb = msb + tl.where(test, 1, 0)
+
+    return tl.where(above > 0, msb, -1)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -191,13 +218,28 @@ def _fused_gdn_decode_update_kernel(
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_TREE: tl.constexpr,
+    PRECOMPUTED_PARENTS: tl.constexpr,
     T_BLOCK: tl.constexpr,
-    Q_STRIDES: tl.constexpr,
-    K_STRIDES: tl.constexpr,
-    V_STRIDES: tl.constexpr,
-    A_STRIDES: tl.constexpr,
-    B_STRIDES: tl.constexpr,
+    Q_STRIDE_B: tl.constexpr,
+    Q_STRIDE_T: tl.constexpr,
+    Q_STRIDE_H: tl.constexpr,
+    Q_STRIDE_K: tl.constexpr,
+    K_STRIDE_B: tl.constexpr,
+    K_STRIDE_T: tl.constexpr,
+    K_STRIDE_H: tl.constexpr,
+    K_STRIDE_K: tl.constexpr,
+    V_STRIDE_B: tl.constexpr,
+    V_STRIDE_T: tl.constexpr,
+    V_STRIDE_HV: tl.constexpr,
+    V_STRIDE_V: tl.constexpr,
+    A_STRIDE_B: tl.constexpr,
+    A_STRIDE_T: tl.constexpr,
+    A_STRIDE_HV: tl.constexpr,
+    B_STRIDE_B: tl.constexpr,
+    B_STRIDE_T: tl.constexpr,
+    B_STRIDE_HV: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    PREFETCH_NEXT: tl.constexpr,
 ):
     """Dense-batch (no varlen) sigmoid-gating delta-rule decode/MTP update.
 
@@ -245,14 +287,14 @@ def _fused_gdn_decode_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + i_n * Q_STRIDES[0] + i_h * Q_STRIDES[2] + o_k * Q_STRIDES[3]
-    p_k = k + i_n * K_STRIDES[0] + i_h * K_STRIDES[2] + o_k * K_STRIDES[3]
-    p_v = v + i_n * V_STRIDES[0] + i_hv * V_STRIDES[2] + o_v * V_STRIDES[3]
-    p_b = b + i_n * B_STRIDES[0] + i_hv * B_STRIDES[2]
+    p_q = q + i_n * Q_STRIDE_B + i_h * Q_STRIDE_H + o_k * Q_STRIDE_K
+    p_k = k + i_n * K_STRIDE_B + i_h * K_STRIDE_H + o_k * K_STRIDE_K
+    p_v = v + i_n * V_STRIDE_B + i_hv * V_STRIDE_HV + o_v * V_STRIDE_V
+    p_b = b + i_n * B_STRIDE_B + i_hv * B_STRIDE_HV
     p_o = o + (i_n * T * HV + i_hv) * V + o_v
 
     p_A_log = A_log + i_hv
-    p_a = a + i_n * A_STRIDES[0] + i_hv * A_STRIDES[2]
+    p_a = a + i_n * A_STRIDE_B + i_hv * A_STRIDE_HV
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -277,39 +319,60 @@ def _fused_gdn_decode_update_kernel(
 
     if HAS_TREE and CACHE_INTERMEDIATE_STATES:
         nodes = tl.arange(0, T_BLOCK)
-        parents = _latest_ancestor(tree_ancestors + i_n * T, nodes, nodes < T)
+        if PRECOMPUTED_PARENTS:
+            parents = tl.load(
+                tree_ancestors + i_n * T + nodes,
+                mask=nodes < T,
+                other=-1,
+            )
+        else:
+            parents = _latest_ancestor(tree_ancestors + i_n * T, nodes, nodes < T)
 
-    # Prefetch the next step's operands to overlap the current state update.
     b_A_log = tl.load(p_A_log).to(tl.float32)
     b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
-    n_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-    n_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-    n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-    n_b = tl.load(p_b).to(tl.float32)
-    n_a = tl.load(p_a).to(tl.float32)
+
+    if PREFETCH_NEXT:
+        n_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        n_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        n_b = tl.load(p_b).to(tl.float32)
+        n_a = tl.load(p_a).to(tl.float32)
+
     for step_idx in range(0, T):
-        b_q = n_q
-        b_k = n_k
-        b_v = n_v
-        b_b = n_b
-        b_a = n_a
-        has_next = step_idx + 1 < T
-        n_q = tl.load(p_q + Q_STRIDES[1], mask=mask_k & has_next, other=0).to(
-            tl.float32
-        )
-        n_k = tl.load(p_k + K_STRIDES[1], mask=mask_k & has_next, other=0).to(
-            tl.float32
-        )
-        n_v = tl.load(p_v + V_STRIDES[1], mask=mask_v & has_next, other=0).to(
-            tl.float32
-        )
-        n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
-        n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        if PREFETCH_NEXT:
+            b_q = n_q
+            b_k = n_k
+            b_v = n_v
+            b_b = n_b
+            b_a = n_a
+
+            has_next = step_idx + 1 < T
+            n_q = tl.load(p_q + Q_STRIDE_T, mask=mask_k & has_next, other=0).to(
+                tl.float32
+            )
+            n_k = tl.load(p_k + K_STRIDE_T, mask=mask_k & has_next, other=0).to(
+                tl.float32
+            )
+            n_v = tl.load(p_v + V_STRIDE_T, mask=mask_v & has_next, other=0).to(
+                tl.float32
+            )
+            n_b = tl.load(p_b + B_STRIDE_T, mask=has_next, other=0).to(tl.float32)
+            n_a = tl.load(p_a + A_STRIDE_T, mask=has_next, other=0).to(tl.float32)
+        else:
+            b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+            b_b = tl.load(p_b).to(tl.float32)
+            b_a = tl.load(p_a).to(tl.float32)
         if HAS_TREE:
-            parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
+            if PRECOMPUTED_PARENTS:
+                parent = tl.load(tree_ancestors + i_n * T + step_idx)
+            else:
+                parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
             if parent != step_idx - 1:
                 # The parent's row was written by this program over the same tile.
-                tl.debug_barrier()
+                if not PRECOMPUTED_PARENTS:
+                    tl.debug_barrier()
                 if CACHE_INTERMEDIATE_STATES:
                     # Replay verify: node states live in the intermediate buffer only.
                     if parent < 0:
@@ -412,12 +475,12 @@ def _fused_gdn_decode_update_kernel(
                     mask=mask_h,
                 )
 
-        p_q += Q_STRIDES[1]
-        p_k += K_STRIDES[1]
-        p_v += V_STRIDES[1]
-        p_b += B_STRIDES[1]
+        p_q += Q_STRIDE_T
+        p_k += K_STRIDE_T
+        p_v += V_STRIDE_T
+        p_b += B_STRIDE_T
         p_o += HV * V
-        p_a += A_STRIDES[1]
+        p_a += A_STRIDE_T
 
     if HAS_OUTPUT_STATE_INDICES:
         out_idx = tl.load(output_state_indices + i_n).to(tl.int64)
@@ -474,6 +537,31 @@ def _launch_fused_gdn_decode_update(
     V = v.shape[3]
     if scale is None:
         scale = K**-0.5
+
+    # Ascend's Triton backend cannot compile the current bit-scan
+    # helper reliably. Precompute parent indices only for tree mode.
+    kernel_tree_data = tree_ancestors
+    precomputed_parents = (
+        current_platform().vendor == "ascend" and tree_ancestors is not None
+    )
+    if precomputed_parents:
+        ancestor_rows = (
+            tree_ancestors.detach().to(device="cpu", dtype=torch.int64).tolist()
+        )
+        parent_rows = []
+        for row in ancestor_rows:
+            row_parents = []
+            for step, mask in enumerate(row):
+                earlier = int(mask) & ((1 << step) - 1)
+                row_parents.append(earlier.bit_length() - 1)
+            parent_rows.append(row_parents)
+
+        kernel_tree_data = torch.tensor(
+            parent_rows,
+            device=tree_ancestors.device,
+            dtype=torch.int32,
+        )
+
     # The kernel addresses output rows densely (row * HV * V * K).
     if output_state is not None and not output_state.is_contiguous():
         raise ValueError(
@@ -508,7 +596,7 @@ def _launch_fused_gdn_decode_update(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=per_token_output_state_indices,
-        tree_ancestors=tree_ancestors,
+        tree_ancestors=kernel_tree_data,
         scale=scale,
         T=T,
         H=H,
@@ -523,15 +611,30 @@ def _launch_fused_gdn_decode_update(
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
         HAS_TREE=tree_ancestors is not None,
+        PRECOMPUTED_PARENTS=precomputed_parents,
         T_BLOCK=1 if tree_ancestors is None else triton.next_power_of_2(T),
-        Q_STRIDES=q.stride(),
-        K_STRIDES=k.stride(),
-        V_STRIDES=v.stride(),
-        A_STRIDES=a.stride(),
-        B_STRIDES=b.stride(),
+        Q_STRIDE_B=q.stride(0),
+        Q_STRIDE_T=q.stride(1),
+        Q_STRIDE_H=q.stride(2),
+        Q_STRIDE_K=q.stride(3),
+        K_STRIDE_B=k.stride(0),
+        K_STRIDE_T=k.stride(1),
+        K_STRIDE_H=k.stride(2),
+        K_STRIDE_K=k.stride(3),
+        V_STRIDE_B=v.stride(0),
+        V_STRIDE_T=v.stride(1),
+        V_STRIDE_HV=v.stride(2),
+        V_STRIDE_V=v.stride(3),
+        A_STRIDE_B=a.stride(0),
+        A_STRIDE_T=a.stride(1),
+        A_STRIDE_HV=a.stride(2),
+        B_STRIDE_B=b.stride(0),
+        B_STRIDE_T=b.stride(1),
+        B_STRIDE_HV=b.stride(2),
         num_warps=1,
         num_stages=3,
         ENABLE_PDL=enable_pdl,
+        PREFETCH_NEXT=current_platform().vendor != "ascend",
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return o
@@ -542,7 +645,7 @@ def _launch_fused_gdn_decode_update(
     "gdn_decode_step",
     name="triton_gdn_decode_step",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
@@ -910,6 +1013,56 @@ def triton_gdn_decode_mtp(
     ``intermediate_states_buffer`` in the chunked form, which also fills
     ``replay_payload``, the others step by step.
     """
+    # Ascend FP32 state-scatter fallback: compute all token states
+    # into scratch first, then scatter after the kernel has completed.
+    _state_destination = initial_state if output_state is None else output_state
+    if (
+        current_platform().vendor == "ascend"
+        and _state_destination.dtype == torch.float32
+        and output_state_indices is not None
+        and tree_ancestors is None
+        and replay_payload is None
+    ):
+        B, T, HV, V = v.shape
+        K = q.shape[-1]
+
+        if intermediate_states_buffer is None:
+            intermediate_states_buffer = torch.empty(
+                (B, T, HV, V, K),
+                device=initial_state.device,
+                dtype=_state_destination.dtype,
+            )
+
+        out = _launch_fused_gdn_decode_update(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            output_state=output_state,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            disable_state_update=True,
+            output_state_indices=None,
+            intermediate_states_buffer=intermediate_states_buffer,
+            per_token_output_state_indices=None,
+            tree_ancestors=None,
+        )
+
+        flat_indices = output_state_indices.reshape(-1)
+        flat_states = intermediate_states_buffer.reshape(B * T, HV, V, K)
+        valid = flat_indices >= 0
+        _state_destination.index_copy_(
+            0,
+            flat_indices[valid].to(torch.long),
+            flat_states[valid],
+        )
+        return out
+
     if (
         tree_ancestors is not None
         and output_state_indices is None

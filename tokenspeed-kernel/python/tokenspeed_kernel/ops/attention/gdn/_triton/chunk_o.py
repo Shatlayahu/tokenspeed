@@ -55,6 +55,8 @@ def chunk_fwd_kernel_o(
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
+    BM: tl.constexpr,
+    NUM_ROW_TILES: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
@@ -65,7 +67,10 @@ def chunk_fwd_kernel_o(
         tl.extra.cuda.gdc_wait()
         # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_v = tl.program_id(0)
+    rt = tl.program_id(1)
+    i_t, tile_m = rt // NUM_ROW_TILES, rt % NUM_ROW_TILES
+    i_bh = tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -85,6 +90,8 @@ def chunk_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
+    row_start = i_t * BT + tile_m * BM
+
     # offset calculation
     q += (bos * Hg + i_h // (H // Hg)) * K
     k += (bos * Hg + i_h // (H // Hg)) * K
@@ -92,12 +99,12 @@ def chunk_fwd_kernel_o(
     o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * K * V
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    b_o = tl.zeros([BM, BV], dtype=tl.float32)
+    b_A = tl.zeros([BM, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(
-            q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+            q, (T, K), (Hg * K, 1), (row_start, i_k * BK), (BM, BK), (1, 0)
         )
         p_k = tl.make_block_ptr(
             k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
@@ -119,20 +126,23 @@ def chunk_fwd_kernel_o(
 
     if USE_G:
         g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,), padding_option="zero")
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
+        p_gm = tl.make_block_ptr(g, (T,), (H,), (row_start,), (BM,), (0,))
+        p_gn = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        bgm = tl.load(p_gm, boundary_check=(0,), padding_option="zero")
+        bgn = tl.load(p_gn, boundary_check=(0,), padding_option="zero")
+        b_o = b_o * exp(bgm)[:, None]
+        b_A = b_A * safe_exp(bgm[:, None] - bgn[None, :])
 
-    o_i = tl.arange(0, BT)
-    m_A = o_i[:, None] >= o_i[None, :]
+    o_m = tile_m * BM + tl.arange(0, BM)
+    o_n = tl.arange(0, BT)
+    m_A = o_m[:, None] >= o_n[None, :]
     b_A = tl.where(m_A, b_A, 0)
 
     p_v = tl.make_block_ptr(
         v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )
     p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        o, (T, V), (H * V, 1), (row_start, i_v * BV), (BM, BV), (1, 0)
     )
     b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
 
@@ -165,8 +175,11 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v)
 
+    BM = 16
+    NUM_ROW_TILES = triton.cdiv(BT, BM)
+
     def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+        return (triton.cdiv(V, meta["BV"]), NT * NUM_ROW_TILES, B * H)
 
     chunk_fwd_kernel_o[grid](
         q,
@@ -184,12 +197,16 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        BM=BM,
+        NUM_ROW_TILES=NUM_ROW_TILES,
         BK=128,
         # gfx950: one 128-wide V tile reads each chunk state once.
-        BV=128 if current_platform().is_cdna4 else 64,
+        BV=128 if current_platform().is_cdna4 else 32,
         num_warps=4,
         num_stages=2,
         ENABLE_PDL=enable_pdl,
+        enable_ubuf_saving=True,
+        multibuffer=False,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return o

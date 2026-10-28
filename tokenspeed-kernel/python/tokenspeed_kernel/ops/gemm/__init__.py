@@ -31,7 +31,11 @@ import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
-import tokenspeed_kernel.ops.gemm.gluon_gemv  # noqa: F401
+from tokenspeed_kernel._triton import gluon as _gluon
+
+if _gluon is not None:
+    import tokenspeed_kernel.ops.gemm.gluon_gemv  # noqa: F401
+
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
 import tokenspeed_kernel.ops.gemm.torch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
