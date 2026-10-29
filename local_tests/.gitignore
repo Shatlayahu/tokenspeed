@@ -1,0 +1,5 @@
+logs/
+*.log
+__pycache__/
+.pytest_cache/
+qwen35/results/

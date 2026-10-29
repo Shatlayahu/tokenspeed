@@ -307,8 +307,12 @@ def __getattr__(name: str):
     if name == "MXFP8_BLOCK_SCALE":
         import torch
 
+        # PyTorch < 2.9 does not expose the UE8M0 dtype. Ascend's BF16 path
+        # never selects MXFP8 kernels, so use an inert storage placeholder to
+        # keep format registration importable on the validated server stack.
+        storage_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
         value = ScaleFormat(
-            storage_dtype=torch.float8_e8m0fnu,
+            storage_dtype=storage_dtype,
             granularity="block",
             block_shape=(1, 32),
         )

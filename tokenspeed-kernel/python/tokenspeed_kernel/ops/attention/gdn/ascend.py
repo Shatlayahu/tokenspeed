@@ -1,7 +1,6 @@
 """Ascend backend for GDN chunked prefill."""
 
 import torch
-
 from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -20,9 +19,7 @@ from tokenspeed_kernel.signature import format_signatures
     name="ascend_gdn_chunk_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.bfloat16}
-    ),
+    signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
         "output_h": frozenset({False, True}),
@@ -67,8 +64,7 @@ def ascend_gdn_chunk_prefill(
         return GdnChunkPrefillResult(
             out=out,
             final_state=(
-                final_state.transpose(-2, -1)
-                if final_state is not None else None
+                final_state.transpose(-2, -1) if final_state is not None else None
             ),
             h=h.transpose(-2, -1),
             h_layout=GdnCheckpointLayout.FLA,
@@ -78,7 +74,6 @@ def ascend_gdn_chunk_prefill(
     return GdnChunkPrefillResult(
         out=out,
         final_state=(
-            final_state.transpose(-2, -1)
-            if final_state is not None else None
+            final_state.transpose(-2, -1) if final_state is not None else None
         ),
     )

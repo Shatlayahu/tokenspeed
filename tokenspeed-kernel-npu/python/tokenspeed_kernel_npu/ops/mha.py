@@ -61,6 +61,43 @@ def _check_options(
         raise NotImplementedError("Ascend MHA does not return LSE")
 
 
+def _mha_prefill_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    softmax_scale: float | None,
+) -> torch.Tensor:
+    """Torch fallback for head sizes unsupported by the fused Ascend operator."""
+    outputs = []
+    num_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    if num_heads % num_kv_heads:
+        raise ValueError(
+            f"query heads ({num_heads}) must be divisible by KV heads ({num_kv_heads})"
+        )
+    kv_repeats = num_heads // num_kv_heads
+    scale = _scale(q, softmax_scale)
+    for start, end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:]):
+        q_seq = q[start:end].transpose(0, 1)
+        k_seq = k[start:end].transpose(0, 1)
+        v_seq = v[start:end].transpose(0, 1)
+        if kv_repeats != 1:
+            k_seq = k_seq.repeat_interleave(kv_repeats, dim=0)
+            v_seq = v_seq.repeat_interleave(kv_repeats, dim=0)
+        seq_len = end - start
+        scores = torch.matmul(q_seq.float(), k_seq.float().transpose(-2, -1))
+        scores.mul_(scale)
+        causal_mask = torch.triu(
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=q.device),
+            diagonal=1,
+        )
+        scores.masked_fill_(causal_mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1).to(v_seq.dtype)
+        outputs.append(torch.matmul(probs, v_seq).transpose(0, 1))
+    return torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
+
+
 def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -82,6 +119,8 @@ def mha_prefill(
         sinks=sinks,
         return_lse=return_lse,
     )
+    if q.shape[-1] not in (64, 128, 192):
+        return _mha_prefill_reference(q, k, v, cu_seqlens_cpu, softmax_scale)
     output, _ = torch_npu.npu_fused_infer_attention_score(
         q,
         k,

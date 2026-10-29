@@ -22,6 +22,7 @@
 
 import triton
 from triton import language as tl
+
 try:
     from triton import profiler as proton
 except (ImportError, AttributeError):
