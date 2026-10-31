@@ -1209,6 +1209,38 @@ class Qwen3_5ForCausalLM(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+                if name.endswith(".o_proj.weight"):
+                    owner = getattr(weight_loader, "__self__", None)
+                    rank = getattr(owner, "tp_rank", "unknown")
+                    tp_size = getattr(owner, "tp_size", "unknown")
+                    input_dim = getattr(param, "input_dim", None)
+
+                    local_size = (
+                        param.shape[input_dim]
+                        if input_dim is not None else None
+                    )
+                    start = (
+                        rank * local_size
+                        if isinstance(rank, int) and local_size is not None
+                        else "unknown"
+                    )
+                    end = (
+                        start + local_size
+                        if isinstance(start, int) and local_size is not None
+                        else "unknown"
+                    )
+
+                    print(
+                        "[TP_SHARD_CHECK] "
+                        f"rank={rank}/{tp_size} "
+                        f"name={name} "
+                        f"checkpoint_shape={tuple(loaded_weight.shape)} "
+                        f"local_shape={tuple(param.shape)} "
+                        f"shard_axis={input_dim} "
+                        f"local_range=[{start}, {end})",
+                        flush=True,
+                    )
             loaded_params.add(name)
         return loaded_params
 
@@ -1668,6 +1700,20 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+                if "linear_attn.out_proj.weight" in name:
+                    loader_owner = getattr(weight_loader, "__self__", None)
+                    print(
+                        "[TP_SHARD_CHECK] "
+                        f"rank={getattr(loader_owner, 'tp_rank', 'unknown')}/"
+                        f"{getattr(loader_owner, 'tp_size', 'unknown')} "
+                        f"name={name} "
+                        f"checkpoint_shape={tuple(loaded_weight.shape)} "
+                        f"local_shape={tuple(param.shape)} "
+                        f"input_dim={getattr(param, 'input_dim', None)}",
+                        flush=True,
+                    )
+
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
 

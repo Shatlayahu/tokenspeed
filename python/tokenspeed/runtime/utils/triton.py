@@ -18,13 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.platform import current_platform
-
-if current_platform().is_npu:
-    import triton
-    import triton.language as tl
-else:
-    import tokenspeed_triton as triton
-    import tokenspeed_triton.language as tl
+from tokenspeed_kernel._triton import triton, tl
 
 __all__ = ["tl", "triton"]

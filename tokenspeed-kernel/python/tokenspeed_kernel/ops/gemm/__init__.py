@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from functools import partial
 from math import prod
 
+from tokenspeed_kernel.platform import Platform
+
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
@@ -33,9 +35,8 @@ import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 from tokenspeed_kernel._triton import gluon as _gluon
 
-if _gluon is not None:
+if Platform.get().is_nvidia and _gluon is not None:
     import tokenspeed_kernel.ops.gemm.gluon_gemv  # noqa: F401
-
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
 import tokenspeed_kernel.ops.gemm.torch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
@@ -77,7 +78,7 @@ from tokenspeed_kernel.ops.gemm.triton import (
     MXFP4_LINEAR_SIGNATURE,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import Platform, pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
