@@ -9,7 +9,9 @@ CANN_ROOT="${TS_CANN_ROOT:-/usr/local/Ascend/cann-9.0.0}"
 MODEL_DIR="${TS_MODEL_DIR:-}"
 
 # Activate the existing Python and Ascend environments.
-source "${VENV_ROOT}/bin/activate"
+if [[ -f "${VENV_ROOT}/bin/activate" ]]; then
+    source "${VENV_ROOT}/bin/activate"
+fi
 source "${CANN_ROOT}/set_env.sh"
 set -u
 
