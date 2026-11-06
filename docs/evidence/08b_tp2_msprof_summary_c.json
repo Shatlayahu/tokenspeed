@@ -1,0 +1,29 @@
+{
+  "experiment": "Qwen3.5-0.8B TP=2 on physical NPU 6 and 7",
+  "tool": "CANN 9.0.0 msprof --hccl=on --task-time=l1 --runtime-api=on",
+  "scope": "Rank 1 / physical NPU 7 only; Rank 0 profile directory had no device data",
+  "raw_profile_directory": "$HOME/hw2-c-results/08b-tp2/profile",
+  "exported_csv": "communication_statistic_20261106131502.csv and op_summary_20261106131502.csv",
+  "window_us": {
+    "start": 1793970505978000,
+    "duration": 10000000
+  },
+  "window_task_types": {
+    "compute_ai_core_vector_mix": {
+      "count": 10919,
+      "interval_union_s": 0.115801,
+      "sum_task_wait_time_s": 1.311831
+    },
+    "communication_hcom": {
+      "count": 796,
+      "interval_union_s": 9.724476,
+      "sum_task_wait_time_s": 0.02275
+    },
+    "other_ai_cpu": {
+      "count": 907,
+      "interval_union_s": 0.16935,
+      "sum_task_wait_time_s": 0.152676
+    }
+  },
+  "caveat": "Profiler made requests much slower than the unprofiled baseline. The 10-second slice contains part of a request. Interval unions of categories overlap. Task Wait Time is a sum of per-task waits, not end-to-end or scheduler waiting. Values must not be added to derive latency or used as a representative communication percentage."
+}

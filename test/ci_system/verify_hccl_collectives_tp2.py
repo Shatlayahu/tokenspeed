@@ -3,11 +3,11 @@ import os
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
 
 
 def main():
@@ -64,8 +64,7 @@ def main():
         torch.testing.assert_close(gathered, expected_gathered)
 
         print(
-            f"PASS: All Gather rank={rank}, "
-            f"result={gathered.cpu().tolist()}",
+            f"PASS: All Gather rank={rank}, " f"result={gathered.cpu().tolist()}",
             flush=True,
         )
 
@@ -84,8 +83,7 @@ def main():
         assert abs(rs_output.item() - expected) < 1e-5
 
         print(
-            f"PASS: Reduce Scatter rank={rank}, "
-            f"result={rs_output.item()}",
+            f"PASS: Reduce Scatter rank={rank}, " f"result={rs_output.item()}",
             flush=True,
         )
 
@@ -112,8 +110,7 @@ def main():
         assert abs(token_output.item() - expected) < 1e-5
 
         print(
-            f"PASS: Token Reduce Scatter rank={rank}, "
-            f"result={token_output.item()}",
+            f"PASS: Token Reduce Scatter rank={rank}, " f"result={token_output.item()}",
             flush=True,
         )
 

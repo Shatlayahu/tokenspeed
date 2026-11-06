@@ -3,11 +3,11 @@ import os
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
 
 
 def main():
@@ -46,8 +46,7 @@ def main():
 
         result = x.item()
         print(
-            f"rank={rank}, device=npu:{local_rank}, "
-            f"result={result}",
+            f"rank={rank}, device=npu:{local_rank}, " f"result={result}",
             flush=True,
         )
         assert result == 3.0, f"Expected 3.0, got {result}"
