@@ -65,8 +65,44 @@ bash local_tests/qwen35/profile_tp2_msprof.sh
 汇报时不能用单 Rank 时间线推算双 Rank 端到端通信占比，也不能把任务等待
 字段当成服务排队时间。
 
-较大模型仍需一份 TP=2 吞吐/延迟原始记录。取得 9B 或 27B 权重和对应已启动
-服务后，复用 `benchmark_tp.py`：设置正确的 `--model` 服务注册名、
-`--model-dir`、`--tp 2 --physical-devices 6,7`，选择两档输入与并发，并记录
-两 Rank 日志及运行期 HBM。当前账号没有这些权重，仓库现有 27B 证据只覆盖
-连续请求与设备总 HBM 快照，尚不足以填写性能数值。
+## 9B TP=2 性能与容量
+
+成员 C 从 [Qwen 官方 ModelScope 仓库](https://modelscope.cn/models/Qwen/Qwen3.5-9B/summary)
+直接将 BF16 权重下载到实验服务器（约 19 GB），没有将权重提交到 Git。
+ModelScope CLI 命令：
+
+```bash
+modelscope download Qwen/Qwen3.5-9B \
+  --local-dir "$HOME/models/Qwen3.5-9B" --max-workers 4
+```
+
+当前仓库的 `serve_qwen35_08b_tp2.sh` 将模型路径与服务名作为环境变量，
+因此也可加载 9B；脚本文件名保留原来的 0.8B 名称。两 Rank 已核对同层权重
+分片，实验服务参数如下：
+
+```bash
+export TS_REPO_ROOT=$PWD TS_VENV_ROOT=$HOME/venvs/tokenspeed
+export TS_MODEL_DIR=$HOME/models/Qwen3.5-9B
+export TS_SERVED_MODEL_NAME=qwen3.5-9b TS_PORT=8020
+export TS_MAX_MODEL_LEN=4096 TS_MAX_NUM_SEQS=8
+export TS_GPU_MEMORY_UTILIZATION=0.55 ASCEND_RT_VISIBLE_DEVICES=6,7
+bash test/ci_system/serve_qwen35_08b_tp2.sh
+```
+
+服务就绪后，另开终端运行：
+
+```bash
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+source "$HOME/venvs/tokenspeed/bin/activate"
+python local_tests/qwen35/benchmark_tp.py \
+  --base-url http://127.0.0.1:8021 \
+  --model qwen3.5-9b --model-dir "$HOME/models/Qwen3.5-9B" \
+  --tp 2 --physical-devices 6,7 \
+  --input-lengths 32,1024 --concurrencies 1,4 \
+  --output-tokens 32 --warmups 1 --repeats 3 \
+  --output-dir "$HOME/hw2-c-results/9b-tp2/matrix"
+```
+
+逐请求 JSON 和双 Rank 启动摘录位于 `docs/evidence/9b_tp2_*_c.*`。
+9B 与 0.8B 使用了同一代码快照和 PyTorch/torch-npu 2.6.0；成员 B 早先
+的 9B 记录来自 2.9.0 环境，不能将两次性能测量视为完全一致的环境。

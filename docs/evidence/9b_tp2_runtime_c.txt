@@ -1,0 +1,9 @@
+Selected lines from the C-run 9B TP=2 service log. Timestamps removed; full log remains on the experiment server.
+[ts] Current Process distributed state:  global rank: 0  attn_tp_rank: 0  attn_dp_rank: 0 (distributed_initializer.py:290)
+[ts] Current Process distributed state:  global rank: 1  attn_tp_rank: 1  attn_dp_rank: 0 (distributed_initializer.py:290)
+[ts] [TP_SHARD_CHECK] rank=1/2 name=model.layers.0.linear_attn.out_proj.weight checkpoint_shape=(4096, 4096) local_shape=(4096, 2048) input_dim=1
+[ts] [TP_SHARD_CHECK] rank=0/2 name=model.layers.0.linear_attn.out_proj.weight checkpoint_shape=(4096, 4096) local_shape=(4096, 2048) input_dim=1
+[ts] ModelExecutor initialized (model_executor.py:724)
+[ts] ModelExecutor initialized (model_executor.py:724)
+ts serve ready on http://127.0.0.1:8020
+ts control server ready on http://127.0.0.1:8021
