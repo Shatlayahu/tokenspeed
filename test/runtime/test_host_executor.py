@@ -1,1523 +1,34 @@
+"""Compact Host cache executor tests."""
+
 from __future__ import annotations
 
-import importlib
-import inspect
+import os
 import sys
-import types
-from functools import lru_cache
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, call, patch
-
-import pytest
-import torch
-
-
-@lru_cache(maxsize=1)
-def _load_host_transfer_contract_module():
-    module_name = "tokenspeed_kernel.ops.kvcache.host_transfer"
-    module = sys.modules.get(module_name)
-    if module is not None and hasattr(module, "HostTransferGeometry"):
-        return module
-
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as error:
-        if error.name != "tokenspeed_kernel" and not (error.name or "").startswith(
-            "tokenspeed_triton"
-        ):
-            raise
-        root = Path(__file__).resolve().parents[2] / "python" / "tokenspeed_kernel"
-        packages = (
-            ("tokenspeed_kernel", root),
-            ("tokenspeed_kernel.ops", root / "ops"),
-            ("tokenspeed_kernel.ops.kvcache", root / "ops" / "kvcache"),
-        )
-        stubs = {}
-        for name, path in packages:
-            if name not in sys.modules:
-                pkg = types.ModuleType(name)
-                pkg.__path__ = [str(path)]
-                stubs[name] = pkg
-        triton_stub = MagicMock(name="kvcache_triton_stub")
-        triton_stub.HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
-        stubs["tokenspeed_kernel.ops.kvcache.triton"] = triton_stub
-        spec = importlib.util.spec_from_file_location(
-            "_isolated_host_transfer_contract",
-            root / "ops" / "kvcache" / "host_transfer.py",
-        )
-        module = importlib.util.module_from_spec(spec)
-        stubs[spec.name] = module
-        with patch.dict(sys.modules, stubs):
-            spec.loader.exec_module(module)
-        return module
-
-
-@pytest.fixture
-def host_transfer_contract():
-    module = _load_host_transfer_contract_module()
-    return SimpleNamespace(
-        HostTransferGeometry=module.HostTransferGeometry,
-        HostTransferWorkspace=module.HostTransferWorkspace,
-        build_host_transfer_geometry=module.build_host_transfer_geometry,
-        _triton_is_unavailable=module._triton_is_unavailable,
-        _transfer_cache_ranges=module._transfer_cache_ranges,
-        transfer_cache_blocks=module.transfer_cache_blocks,
-        wait_layer_ready=module.wait_layer_ready,
-    )
-
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA device"
-)
-
-
-def _sample_geometry(
-    contract,
-    *,
-    num_host_lcm_blocks: int = 2,
-    num_device_lcm_blocks: int = 16,
-):
-    return contract.build_host_transfer_geometry(
-        rows=(
-            (0, 0, 100, 96, 80, 0, 4, 40),
-            (0, 0, 100, 96, 80, 40, 4, 40),
-            (1, 1, 200, 2048, 1200, 0, 1, 1000),
-        ),
-        layer_slices=((0, 2), (2, 0), (2, 1)),
-        group_packing=(4, 1),
-        host_lcm_block_bytes=1280,
-        num_host_lcm_blocks=num_host_lcm_blocks,
-        num_device_lcm_blocks=num_device_lcm_blocks,
-        num_device_buffers=2,
-    )
-
-
-def _committed_block_workspace(host_transfer, geometry, transfers):
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(transfers, geometry=geometry)
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    return workspace, num_blocks
-
-
-def _mock_triton_block_path(monkeypatch, host_transfer, workspace):
-    triton_transfer = MagicMock()
-    range_factory = MagicMock(side_effect=AssertionError("ranges must stay lazy"))
-    monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-    monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    workspace.bind_addresses = MagicMock(return_value="addresses")
-    return triton_transfer, range_factory
-
-
-def test_geometry_layer_slices_preserve_empty_layers(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-
-    assert geometry.layer_slices == ((0, 2), (2, 0), (2, 1))
-    assert geometry.num_field_rows == 3
-
-
-def test_geometry_bind_uploads_device_rows_once(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    device = torch.device("cpu")
-
-    first = geometry.bind(device, non_blocking=False)
-    second = first.bind(device, non_blocking=False)
-
-    assert first.device_rows is not None
-    assert first.device_layer_slices is not None
-    assert second.device_rows.data_ptr() == first.device_rows.data_ptr()
-    assert second.device_layer_slices.data_ptr() == first.device_layer_slices.data_ptr()
-    assert torch.equal(first.device_rows, geometry.host_rows)
-    assert torch.equal(
-        first.device_layer_slices,
-        torch.tensor(((0, 2), (2, 0), (2, 1)), dtype=torch.int64),
-    )
-
-
-def test_build_geometry_validates_row_shape_and_fields(host_transfer_contract):
-    build = host_transfer_contract.build_host_transfer_geometry
-    base = dict(
-        rows=((0, 0, 100, 96, 80, 0, 4, 40),),
-        layer_slices=((0, 1),),
-        group_packing=(4,),
-        host_lcm_block_bytes=320,
-        num_host_lcm_blocks=2,
-        num_device_lcm_blocks=16,
-        num_device_buffers=1,
-    )
-
-    with pytest.raises(ValueError, match="8 columns"):
-        build(**{**base, "rows": ((0, 0, 100, 96, 80, 0, 4),)})
-
-    with pytest.raises(IndexError, match="device_buffer_index"):
-        build(**{**base, "rows": ((0, 1, 100, 96, 80, 0, 4, 40),)})
-
-    with pytest.raises(ValueError, match="payload_bytes cannot exceed"):
-        build(**{**base, "rows": ((0, 0, 100, 96, 80, 0, 4, 128),)})
-
-    with pytest.raises(ValueError, match="group packing"):
-        build(**{**base, "rows": ((0, 0, 100, 96, 80, 0, 8, 40),)})
-
-    with pytest.raises(ValueError, match="outside host cache block"):
-        build(**{**base, "rows": ((0, 0, 100, 96, 80, 60, 4, 40),)})
-
-    with pytest.raises(ValueError, match="outside host LCM block"):
-        build(**{**base, "rows": ((0, 0, 100, 96, 81, 0, 4, 40),)})
-
-
-def test_load_block_transfers_buckets_by_group(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    transfers = (
-        (1, 3, 2),
-        (0, 5, 4),
-        (0, 2, 1),
-        (1, 7, 1),
-    )
-
-    num_blocks, group_offsets = workspace.load_block_transfers(
-        transfers,
-        geometry=geometry,
-    )
-
-    assert num_blocks == 4
-    assert group_offsets == (0, 2, 4)
-    assert torch.equal(
-        workspace._block_host[:num_blocks],
-        torch.tensor(
-            ((5, 4), (2, 1), (3, 2), (7, 1)),
-            dtype=torch.int64,
-            device="cpu",
-        ),
-    )
-
-
-def test_per_group_device_block_id_bounds_with_unequal_packing(host_transfer_contract):
-    geometry = host_transfer_contract.build_host_transfer_geometry(
-        rows=(
-            (0, 0, 0, 64, 32, 0, 4, 32),
-            (1, 0, 0, 128, 64, 0, 8, 64),
-        ),
-        layer_slices=((0, 2),),
-        group_packing=(4, 8),
-        host_lcm_block_bytes=512,
-        num_host_lcm_blocks=2,
-        num_device_lcm_blocks=8,
-        num_device_buffers=1,
-    )
-    workspace = host_transfer_contract.HostTransferWorkspace()
-
-    workspace.load_block_transfers(((0, 32, 1),), geometry=geometry)
-    workspace.load_block_transfers(((1, 64, 1),), geometry=geometry)
-
-    with pytest.raises(IndexError, match="device_block_id 33"):
-        workspace.load_block_transfers(((0, 33, 1),), geometry=geometry)
-
-    with pytest.raises(IndexError, match="device_block_id 65"):
-        workspace.load_block_transfers(((1, 65, 1),), geometry=geometry)
-
-
-def test_workspace_prepare_layer_ready_zeros_and_reuses(host_transfer_contract):
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    first = workspace.prepare_layer_ready(3, device)
-    first[:] = 7
-    workspace.layer_cta_counts()[:] = 4
-    reused = workspace.prepare_layer_ready(3, device)
-
-    assert reused.data_ptr() == first.data_ptr()
-    assert reused.tolist() == [0, 0, 0]
-    assert workspace.layer_cta_counts().tolist() == [0, 0, 0]
-
-
-def test_workspace_reuses_block_mapping_storage(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    first = ((0, 2, 1), (1, 3, 2))
-    workspace.load_block_transfers(first, geometry=geometry)
-    host_ptr = workspace._block_host.data_ptr()
-    offsets_ptr = workspace._block_group_offsets_host.data_ptr()
-
-    workspace.load_block_transfers(((0, 4, 3),), geometry=geometry)
-
-    assert workspace._block_host.data_ptr() == host_ptr
-    assert workspace._block_group_offsets_host.data_ptr() == offsets_ptr
-
-
-def test_group_offsets_use_valid_length_after_capacity_growth(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
-    valid_count = geometry.num_groups + 1
-    expanded = torch.zeros(valid_count + 4, dtype=torch.int64, device=device)
-    expanded[:valid_count] = workspace._block_group_offsets_device[:valid_count]
-    expanded[valid_count:] = 999
-    workspace._block_group_offsets_device = expanded
-
-    offsets = workspace.block_group_offsets_device()
-    assert offsets.numel() == valid_count
-    assert offsets.numel() < workspace._block_group_offsets_device.shape[0]
-    assert 999 not in offsets.tolist()
-    assert tuple(int(value) for value in offsets.tolist()) == (0, 1, 1)
-
-
-@pytest.mark.parametrize(
-    "transfers",
-    [
-        ((0, 0, 1),),
-        ((0, 1, 0),),
-        ((0, 2, 0),),
-    ],
-)
-def test_load_block_transfers_rejects_zero_ids(host_transfer_contract, transfers):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-
-    with pytest.raises(ValueError, match="1-based"):
-        workspace.load_block_transfers(transfers, geometry=geometry)
-
-
-@pytest.mark.parametrize(
-    "transfers,match",
-    [
-        (((2, 1, 1),), "group"),
-        (((0, 65, 1),), "device_block_id 65"),
-        (((1, 17, 1),), "device_block_id 17"),
-        (((0, 1, 9),), "host_block_id"),
-        (((1, 1, 3),), "host_block_id"),
-    ],
-)
-def test_load_block_transfers_rejects_out_of_range_ids(
-    host_transfer_contract, transfers, match
-):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-
-    with pytest.raises(IndexError, match=match):
-        workspace.load_block_transfers(transfers, geometry=geometry)
-
-
-def test_empty_load_invalidates_committed_block_state(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
-
-    workspace.load_block_transfers((), geometry=geometry)
-
-    with pytest.raises(ValueError, match="not committed"):
-        workspace.committed_block_tables(1)
-    with pytest.raises(ValueError, match="not committed"):
-        workspace.block_group_offsets_device()
-
-
-def test_accessor_rejects_uncommitted_load(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-
-    workspace.load_block_transfers(((0, 2, 1), (1, 3, 2)), geometry=geometry)
-
-    with pytest.raises(ValueError, match="not committed"):
-        workspace.committed_block_tables(2)
-    with pytest.raises(ValueError, match="not committed"):
-        workspace.block_group_offsets_device()
-
-
-def test_new_load_invalidates_previous_commit(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    first_count, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(first_count, device, non_blocking=False)
-
-    workspace.load_block_transfers(((0, 4, 3),), geometry=geometry)
-
-    with pytest.raises(ValueError, match="not committed"):
-        workspace.committed_block_tables(first_count)
-
-
-def test_commit_rejects_wrong_num_blocks(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (1, 3, 2)),
-        geometry=geometry,
-    )
-
-    with pytest.raises(ValueError, match="must equal"):
-        workspace.commit_block_transfers(num_blocks - 1, device, non_blocking=False)
-
-
-def test_commit_rejects_duplicate_upload(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    device = torch.device("cpu")
-
-    num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
-
-    with pytest.raises(ValueError, match="already committed"):
-        workspace.commit_block_transfers(num_blocks, device, non_blocking=False)
-
-
-def test_committed_tables_are_shared_without_reupload(host_transfer_contract):
-    geometry = _sample_geometry(host_transfer_contract)
-    workspace = host_transfer_contract.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (0, 5, 4), (1, 3, 2)),
-        geometry=geometry,
-    )
-    device = torch.device("cpu")
-    block_table, returned_offsets = workspace.commit_block_transfers(
-        num_blocks, device, non_blocking=False
-    )
-    block_ptr = workspace._block_device.data_ptr()
-    offset_ptr = workspace._block_group_offsets_device.data_ptr()
-
-    committed_blocks, offsets = workspace.committed_block_tables(num_blocks)
-
-    assert committed_blocks.data_ptr() == block_table.data_ptr()
-    assert offsets.data_ptr() == returned_offsets.data_ptr()
-    assert workspace._block_device.data_ptr() == block_ptr
-    assert workspace._block_group_offsets_device.data_ptr() == offset_ptr
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        RuntimeError("requested kernel specialization is not available"),
-        AttributeError("workspace has no attribute misspelled"),
-    ],
-)
-def test_unrelated_errors_are_not_capability_failures(host_transfer_contract, error):
-    assert not host_transfer_contract._triton_is_unavailable(error)
-
-
-@pytest.mark.parametrize(
-    "direction,offset,count", [("d2h", 0, 3), ("h2d", 1, 2), ("h2d", 0, 2)]
-)
-@pytest.mark.parametrize("backend", ["dma", "auto", "triton"])
-def test_flags_require_full_h2d_geometry(
-    host_transfer_contract, direction, offset, count, backend
-):
-    geometry = _sample_geometry(host_transfer_contract)
-    with pytest.raises(ValueError, match="full-geometry H2D"):
-        host_transfer_contract.transfer_cache_blocks(
-            direction,
-            (),
-            torch.empty(0),
-            geometry,
-            host_transfer_contract.HostTransferWorkspace(),
-            None,
-            num_blocks=1,
-            geometry_offset=offset,
-            num_geometry_rows=count,
-            backend=backend,
-            layer_ready_flags=torch.zeros(3, dtype=torch.int32),
-            grid_cap=None,
-        )
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        AttributeError("missing field"),
-        RuntimeError("kernel launch failed"),
-        RuntimeError("mapped host access is not available"),
-    ],
-)
-def test_kernel_errors_never_trigger_dma(monkeypatch, error):
-    module = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(module).bind(torch.device("cpu"), non_blocking=False)
-    workspace, count = _committed_block_workspace(module, geometry, ((0, 2, 1),))
-    kernel, ranges = _mock_triton_block_path(monkeypatch, module, workspace)
-    kernel.side_effect = error
-    with pytest.raises(type(error)) as raised:
-        module.transfer_cache_blocks(
-            "h2d",
-            (torch.empty(1),),
-            torch.empty(1),
-            geometry,
-            workspace,
-            None,
-            num_blocks=count,
-            geometry_offset=0,
-            num_geometry_rows=3,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-    assert raised.value is error
-    ranges.assert_not_called()
-
-
-def test_mapping_fallback_is_scoped_to_buffer_binding(monkeypatch):
-    module = _load_host_transfer_contract_module()
-    buffers, host = (torch.empty(8),), torch.empty(8)
-    platform = SimpleNamespace(
-        device_visible_data_ptr=MagicMock(
-            side_effect=RuntimeError("hipHostGetDevicePointer failed")
-        )
-    )
-    monkeypatch.setattr(module, "current_platform", lambda: platform)
-    failed = module.HostTransferWorkspace()
-    with pytest.warns(RuntimeWarning, match="falling back"):
-        assert failed.prepare_backend(buffers, host, backend="auto").backend == "dma"
-    assert failed.prepare_backend(buffers, host, backend="auto").backend == "dma"
-    platform.device_visible_data_ptr.assert_called_once()
-    with pytest.raises(RuntimeError, match="mapped Host"):
-        failed.prepare_backend(buffers, host, backend="triton")
-
-    platform.device_visible_data_ptr.side_effect = None
-    platform.device_visible_data_ptr.return_value = host.data_ptr()
-    other = module.HostTransferWorkspace()
-    assert other.prepare_backend(buffers, host, backend="auto").backend == "triton"
-    assert (
-        failed.prepare_backend(buffers, torch.empty(16), backend="auto").backend
-        == "triton"
-    )
-
-
-def test_mapping_attribute_bug_is_not_silently_downgraded(monkeypatch):
-    module = _load_host_transfer_contract_module()
-    monkeypatch.setattr(module, "current_platform", lambda: SimpleNamespace())
-    with pytest.raises(AttributeError, match="device_visible_data_ptr"):
-        module.HostTransferWorkspace().prepare_backend(
-            (torch.empty(1),), torch.empty(1), backend="auto"
-        )
-
-
-def test_work_sizing_does_not_read_static_tensor_again(monkeypatch):
-    module = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(module)
-    workspace = module.HostTransferWorkspace()
-    workspace.load_block_transfers(((0, 2, 1), (0, 3, 2), (1, 3, 1)), geometry=geometry)
-    workspace.block_group_offsets_host = lambda: SimpleNamespace(
-        tolist=lambda: [0, 2, 3]
-    )
-    with patch.object(
-        torch.Tensor, "tolist", side_effect=AssertionError("static tensor read")
-    ):
-        assert (
-            module._block_work_items(
-                geometry, workspace, geometry_offset=0, num_geometry_rows=3
-            )
-            == 2
-        )
-
-
-def test_block_transfer_rejects_unknown_direction():
-    host_transfer = _load_host_transfer_contract_module()
-
-    with pytest.raises(ValueError, match="direction"):
-        host_transfer.transfer_cache_blocks(
-            "sideways",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
-            _sample_geometry(host_transfer),
-            host_transfer.HostTransferWorkspace(),
-            stream=None,
-            num_blocks=0,
-            geometry_offset=0,
-            num_geometry_rows=0,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-
-
-def test_block_h2d_triton_uses_committed_tables_without_expanding_ranges(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace, num_blocks = _committed_block_workspace(
-        host_transfer,
-        geometry,
-        (
-            (0, 2, 1),
-            (0, 3, 2),
-            (0, 4, 3),
-            (0, 5, 4),
-            (1, 3, 2),
-            (1, 4, 1),
-        ),
-    )
-    triton_transfer, range_factory = _mock_triton_block_path(
-        monkeypatch, host_transfer, workspace
-    )
-    device_buffer = torch.empty(1, dtype=torch.uint8)
-
-    host_transfer.transfer_cache_blocks(
-        "h2d",
-        (device_buffer,),
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-        backend="triton",
-        grid_cap=7,
-        layer_ready_flags=None,
-    )
-
-    workspace.bind_addresses.assert_called_once()
-    range_factory.assert_not_called()
-    triton_transfer.assert_called_once()
-    args, kwargs = triton_transfer.call_args
-    assert args[0] == "addresses"
-    assert args[1].data_ptr() == geometry.device_rows.data_ptr()
-    assert args[2].data_ptr() == workspace._block_device.data_ptr()
-    assert args[3].numel() == geometry.num_groups + 1
-    assert args[4] == 1
-    assert kwargs == {
-        "geometry_offset": 2,
-        "num_geometry_rows": 1,
-        "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
-        "work_items": 2,
-        "num_device_buffers": 1,
-        "grid_cap": 7,
-        "layer_ready_flags": None,
-        "layer_slices": None,
-        "layer_cta_counts": None,
-    }
-
-
-def test_block_h2d_triton_layered_flags_launch_full_geometry_once(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    monkeypatch.setattr(host_transfer, "layer_ready_ptx_supported", lambda: True)
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace, num_blocks = _committed_block_workspace(
-        host_transfer,
-        geometry,
-        ((0, 2, 1), (1, 3, 2)),
-    )
-    flags = workspace.prepare_layer_ready(
-        len(geometry.layer_slices), torch.device("cpu")
-    )
-    triton_transfer, range_factory = _mock_triton_block_path(
-        monkeypatch, host_transfer, workspace
-    )
-
-    host_transfer.transfer_cache_blocks(
-        "h2d",
-        (torch.empty(1, dtype=torch.uint8),),
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=geometry.num_field_rows,
-        backend="triton",
-        layer_ready_flags=flags,
-        grid_cap=None,
-    )
-
-    range_factory.assert_not_called()
-    triton_transfer.assert_called_once()
-    args, kwargs = triton_transfer.call_args
-    assert args[4] == 1
-    assert kwargs["geometry_offset"] == 0
-    assert kwargs["num_geometry_rows"] == geometry.num_field_rows
-    assert kwargs["layer_ready_flags"].data_ptr() == flags.data_ptr()
-    assert kwargs["layer_slices"].data_ptr() == geometry.device_layer_slices.data_ptr()
-    assert (
-        kwargs["layer_cta_counts"].data_ptr() == workspace.layer_cta_counts().data_ptr()
-    )
-
-
-def test_block_d2h_triton_reuses_geometry_without_expanding_ranges(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace, num_blocks = _committed_block_workspace(
-        host_transfer,
-        geometry,
-        ((0, 2, 1), (1, 3, 2)),
-    )
-    triton_transfer, range_factory = _mock_triton_block_path(
-        monkeypatch, host_transfer, workspace
-    )
-    device_buffers = (
-        torch.empty(1, dtype=torch.uint8),
-        torch.empty(1, dtype=torch.uint8),
-    )
-
-    host_transfer.transfer_cache_blocks(
-        "d2h",
-        device_buffers,
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=geometry.num_field_rows,
-        backend="triton",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    range_factory.assert_not_called()
-    args = triton_transfer.call_args.args
-    assert args[0] == "addresses"
-    assert args[1].data_ptr() == geometry.device_rows.data_ptr()
-    assert args[4] == 0
-
-
-def test_block_h2d_triton_uses_max_real_work_across_layer_groups(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = host_transfer.build_host_transfer_geometry(
-        rows=(
-            (0, 0, 0, 8192, 6000, 0, 1, 5003),
-            (1, 0, 0, 64, 32, 0, 1, 32),
-        ),
-        layer_slices=((0, 2),),
-        group_packing=(1, 1),
-        host_lcm_block_bytes=6000,
-        num_host_lcm_blocks=8,
-        num_device_lcm_blocks=8,
-        num_device_buffers=1,
-    ).bind(torch.device("cpu"), non_blocking=False)
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 1, 1), (0, 2, 2), (1, 1, 1), (1, 2, 2), (1, 3, 3)),
-        geometry=geometry,
-    )
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    workspace.bind_addresses = MagicMock(return_value=object())
-    triton_transfer = MagicMock()
-    monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-
-    host_transfer.transfer_cache_blocks(
-        "h2d",
-        (torch.empty(1, dtype=torch.uint8),),
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=2,
-        backend="triton",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    # Group 0: 2 blocks * 2 chunks = 4. Group 1: 3 blocks * 1 chunk = 3.
-    assert triton_transfer.call_args.kwargs["work_items"] == 4
-
-
-@pytest.mark.parametrize("backend", ["auto", "triton"])
-@pytest.mark.parametrize("direction", ["h2d", "d2h"])
-def test_block_transfer_skips_empty_layer_before_mapping(
-    monkeypatch, backend, direction
-):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1),),
-        geometry=geometry,
-    )
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    triton_transfer = MagicMock()
-    monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-
-    mapper = MagicMock(
-        side_effect=AssertionError("empty layer must not map Host memory")
-    )
-    monkeypatch.setattr(workspace, "bind_addresses", mapper)
-
-    host_transfer.transfer_cache_blocks(
-        direction,
-        (torch.empty(1, dtype=torch.uint8),),
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-        backend=backend,
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    triton_transfer.assert_not_called()
-    mapper.assert_not_called()
-
-
-def test_public_transfer_arguments_are_explicit():
-    module = _load_host_transfer_contract_module()
-    for function in (
-        module.HostTransferMode,
-        module.HostTransferGeometry.bind,
-        module.HostTransferWorkspace.prepare_backend,
-        module.HostTransferWorkspace.commit_block_transfers,
-        module.transfer_cache_blocks,
-    ):
-        assert all(
-            p.default is inspect.Parameter.empty
-            for p in inspect.signature(function).parameters.values()
-        ), function.__qualname__
-
-
-@pytest.mark.parametrize("requested_num_blocks", [1, 3])
-def test_block_h2d_triton_requires_exact_committed_block_count(
-    monkeypatch,
-    requested_num_blocks,
-):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace = host_transfer.HostTransferWorkspace()
-    committed_count, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (1, 3, 2)),
-        geometry=geometry,
-    )
-    workspace.commit_block_transfers(
-        committed_count, torch.device("cpu"), non_blocking=False
-    )
-    workspace.bind_addresses = MagicMock(return_value=object())
-    monkeypatch.setattr(
-        host_transfer,
-        "_transfer_cache_blocks_triton",
-        MagicMock(),
-    )
-
-    with pytest.raises(ValueError, match="committed block count"):
-        host_transfer.transfer_cache_blocks(
-            "h2d",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
-            geometry,
-            workspace,
-            stream=None,
-            num_blocks=requested_num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-            backend="triton",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-    host_transfer._transfer_cache_blocks_triton.assert_not_called()
-
-
-@pytest.mark.parametrize("direction", ["d2h", "h2d"])
-def test_block_dma_expands_ranges_without_binding_device_metadata(
-    monkeypatch, direction
-):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer)
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (1, 3, 2)),
-        geometry=geometry,
-    )
-    ranges = ((1, 6344, 1280, 1000),)
-    range_factory = MagicMock(return_value=ranges)
-    range_transfer = MagicMock()
-    monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
-    workspace.bind_addresses = MagicMock(
-        side_effect=AssertionError("DMA must not bind addresses")
-    )
-    workspace.commit_block_transfers = MagicMock(
-        side_effect=AssertionError("DMA must not commit blocks")
-    )
-
-    host_transfer.transfer_cache_blocks(
-        direction,
-        (torch.empty(1, dtype=torch.uint8),),
-        torch.empty(1, dtype=torch.uint8),
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-        backend="dma",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    range_factory.assert_called_once_with(
-        geometry,
-        workspace,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-    )
-    range_transfer.assert_called_once_with(
-        direction,
-        (ANY,),
-        ANY,
-        ranges,
-        None,
-    )
-    workspace.bind_addresses.assert_not_called()
-    workspace.commit_block_transfers.assert_not_called()
-
-
-def test_block_h2d_range_factory_expands_only_requested_geometry_slice():
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer)
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (0, 5, 4), (1, 3, 2)),
-        geometry=geometry,
-    )
-
-    ranges = host_transfer._make_block_ranges(
-        geometry,
-        workspace,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=2,
-    )
-
-    assert ranges == (
-        (0, 292, 0, 40),
-        (0, 580, 240, 40),
-        (0, 292, 40, 40),
-        (0, 580, 280, 40),
-    )
-
-
-def test_block_h2d_range_factory_reads_only_referenced_group_rows():
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer)
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (0, 5, 4), (1, 3, 2)),
-        geometry=geometry,
-    )
-    block_rows = workspace.host_block_rows(num_blocks)
-    accesses = []
-
-    class SliceOnlyRows:
-        def __getitem__(self, key):
-            accesses.append(key)
-            return block_rows[key]
-
-        def tolist(self):
-            raise AssertionError("must not materialize the complete block table")
-
-    workspace.host_block_rows = MagicMock(return_value=SliceOnlyRows())
-
-    ranges = host_transfer._make_block_ranges(
-        geometry,
-        workspace,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-    )
-
-    assert ranges == ((1, 6344, 1280, 1000),)
-    assert accesses == [slice(2, 3)]
-
-
-def test_block_h2d_auto_only_expands_after_capability_failure(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1),),
-        geometry=geometry,
-    )
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    workspace.bind_addresses = MagicMock(
-        side_effect=host_transfer._MappedHostUnavailable(
-            "mapped host access is not available"
-        )
-    )
-    ranges = ((0, 292, 0, 40), (0, 332, 40, 40))
-    range_factory = MagicMock(return_value=ranges)
-    range_transfer = MagicMock()
-    monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
-    monkeypatch.setattr(
-        host_transfer,
-        "_transfer_cache_blocks_triton",
-        MagicMock(
-            side_effect=AssertionError("kernel must not launch on capability failure")
-        ),
-    )
-
-    with pytest.warns(RuntimeWarning, match="falling back"):
-        host_transfer.transfer_cache_blocks(
-            "h2d",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
-            geometry,
-            workspace,
-            stream=None,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-
-    range_factory.assert_called_once()
-    range_transfer.assert_called_once()
-
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(((0, 2, 1),), geometry=geometry)
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    workspace.bind_addresses = MagicMock(return_value=object())
-    monkeypatch.setattr(
-        host_transfer,
-        "_transfer_cache_blocks_triton",
-        MagicMock(side_effect=RuntimeError("kernel launch failed")),
-    )
-    range_factory.reset_mock()
-    range_transfer.reset_mock()
-    with pytest.raises(RuntimeError, match="kernel launch failed"):
-        host_transfer.transfer_cache_blocks(
-            "h2d",
-            (torch.empty(1, dtype=torch.uint8),),
-            torch.empty(1, dtype=torch.uint8),
-            geometry,
-            workspace,
-            stream=None,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-    range_factory.assert_not_called()
-    range_transfer.assert_not_called()
-
-
-def test_block_h2d_auto_capability_fallback_persists_across_layers(monkeypatch):
-    host_transfer = _load_host_transfer_contract_module()
-    geometry = _sample_geometry(host_transfer).bind(
-        torch.device("cpu"), non_blocking=False
-    )
-    workspace = host_transfer.HostTransferWorkspace()
-    num_blocks, _ = workspace.load_block_transfers(
-        ((0, 2, 1), (1, 3, 2)),
-        geometry=geometry,
-    )
-    workspace.commit_block_transfers(
-        num_blocks, torch.device("cpu"), non_blocking=False
-    )
-    workspace.bind_addresses = MagicMock(
-        side_effect=host_transfer._MappedHostUnavailable(
-            "mapped host access is not available"
-        )
-    )
-    triton_transfer = MagicMock()
-    buffers = (torch.empty(1, dtype=torch.uint8),)
-    host = torch.empty(1, dtype=torch.uint8)
-    range_factory = MagicMock(
-        side_effect=(
-            ((0, 292, 0, 40),),
-            ((0, 6344, 1280, 1000),),
-        )
-    )
-    range_transfer = MagicMock()
-    monkeypatch.setattr(host_transfer, "_transfer_cache_blocks_triton", triton_transfer)
-    monkeypatch.setattr(host_transfer, "_make_block_ranges", range_factory)
-    monkeypatch.setattr(host_transfer, "_transfer_cache_ranges", range_transfer)
-
-    with pytest.warns(RuntimeWarning, match="falling back"):
-        host_transfer.transfer_cache_blocks(
-            "h2d",
-            buffers,
-            host,
-            geometry,
-            workspace,
-            stream=None,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-    host_transfer.transfer_cache_blocks(
-        "h2d",
-        buffers,
-        host,
-        geometry,
-        workspace,
-        stream=None,
-        num_blocks=num_blocks,
-        geometry_offset=2,
-        num_geometry_rows=1,
-        backend="auto",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    assert workspace.prepare_backend(buffers, host, backend="auto").backend == "dma"
-    workspace.bind_addresses.assert_called_once()
-    triton_transfer.assert_not_called()
-    assert range_factory.call_args_list == [
-        call(
-            geometry,
-            workspace,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=2,
-        ),
-        call(
-            geometry,
-            workspace,
-            num_blocks=num_blocks,
-            geometry_offset=2,
-            num_geometry_rows=1,
-        ),
-    ]
-    assert range_transfer.call_count == 2
-
-
-@requires_cuda
-def test_cache_ranges_dma_round_trip_across_multiple_device_buffers():
-    transfer_cache_ranges = _load_host_transfer_contract_module()._transfer_cache_ranges
-
-    first = torch.arange(64, dtype=torch.uint8, device="cuda")
-    second = torch.arange(48, dtype=torch.bfloat16, device="cuda")
-    second_bytes = second.view(torch.uint8)
-    host = torch.zeros(96, dtype=torch.uint8, pin_memory=True)
-    ranges = ((0, 8, 0, 24), (1, 16, 48, 32))
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-
-    transfer_cache_ranges("d2h", (first, second), host, ranges, stream)
-    stream.synchronize()
-    assert torch.equal(host[0:24], first[8:32].cpu())
-    assert torch.equal(host[48:80], second_bytes[16:48].cpu())
-
-    host[0:24].fill_(7)
-    host[48:80].fill_(9)
-    transfer_cache_ranges("h2d", (first, second), host, ranges, stream)
-    stream.synchronize()
-    assert torch.equal(first[8:32].cpu(), torch.full((24,), 7, dtype=torch.uint8))
-    assert torch.equal(
-        second_bytes[16:48].cpu(), torch.full((32,), 9, dtype=torch.uint8)
-    )
-
-
-@requires_cuda
-def test_geometry_block_transfer_is_byte_exact_for_packed_multigroup_fields():
-    module = _load_host_transfer_contract_module()
-    geometry = module.build_host_transfer_geometry(
-        rows=(
-            (0, 0, 13, 6001, 5014, 0, 2, 5003),
-            (0, 1, 5, 41, 5014, 5003, 2, 11),
-            (1, 1, 17, 53, 19, 0, 3, 13),
-            (1, 0, 29, 47, 19, 13, 3, 5),
-        ),
-        layer_slices=((0, 4),),
-        group_packing=(2, 3),
-        host_lcm_block_bytes=10028,
-        num_host_lcm_blocks=2,
-        num_device_lcm_blocks=4,
-        num_device_buffers=2,
-    )
-    host = (
-        torch.arange(20056, dtype=torch.int64)
-        .remainder(251)
-        .to(torch.uint8)
-        .pin_memory()
-    )
-    first = torch.full((32768,), 0xA5, dtype=torch.uint8, device="cuda")
-    second = torch.full((32768,), 0x5A, dtype=torch.uint8, device="cuda")
-    workspace = module.HostTransferWorkspace()
-    transfers = ((0, 1, 1), (0, 4, 4), (1, 2, 3), (1, 4, 6))
-    num_blocks, _ = workspace.load_block_transfers(transfers, geometry=geometry)
-    stream = torch.cuda.Stream()
-
-    with torch.cuda.stream(stream):
-        bound_geometry = geometry.bind(first.device, non_blocking=True)
-        workspace.commit_block_transfers(
-            num_blocks,
-            first.device,
-            non_blocking=True,
-        )
-    try:
-        module.transfer_cache_blocks(
-            "h2d",
-            (first, second),
-            host,
-            bound_geometry,
-            workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=4,
-            backend="triton",
-            grid_cap=2,
-            layer_ready_flags=None,
-        )
-    except RuntimeError as error:
-        if (
-            module._triton_is_unavailable(error)
-            or "not device-mapped" in str(error).lower()
-        ):
-            pytest.skip(str(error))
-        raise
-    stream.synchronize()
-
-    expected = (
-        torch.full((32768,), 0xA5, dtype=torch.uint8),
-        torch.full((32768,), 0x5A, dtype=torch.uint8),
-    )
-    rows = geometry.host_rows.tolist()
-    grouped = (((1, 1), (4, 4)), ((2, 3), (4, 6)))
-    for row in rows:
-        (
-            group,
-            buffer,
-            device_zero,
-            stride,
-            host_block_bytes,
-            field_offset,
-            packing,
-            payload,
-        ) = row
-        for device_id, host_id in grouped[group]:
-            parent, child = divmod(host_id - 1, packing)
-            host_offset = (
-                parent * geometry.host_lcm_block_bytes
-                + child * host_block_bytes
-                + field_offset
-            )
-            device_offset = device_zero + device_id * stride
-            expected[buffer][device_offset : device_offset + payload] = host[
-                host_offset : host_offset + payload
-            ]
-    assert torch.equal(first.cpu(), expected[0])
-    assert torch.equal(second.cpu(), expected[1])
-
-    host.zero_()
-    module.transfer_cache_blocks(
-        "d2h",
-        (first, second),
-        host,
-        bound_geometry,
-        workspace,
-        stream,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=4,
-        backend="triton",
-        grid_cap=2,
-        layer_ready_flags=None,
-    )
-    stream.synchronize()
-
-    expected_host = torch.zeros_like(host)
-    for row in rows:
-        (
-            group,
-            buffer,
-            device_zero,
-            stride,
-            host_block_bytes,
-            field_offset,
-            packing,
-            payload,
-        ) = row
-        for device_id, host_id in grouped[group]:
-            parent, child = divmod(host_id - 1, packing)
-            host_offset = (
-                parent * geometry.host_lcm_block_bytes
-                + child * host_block_bytes
-                + field_offset
-            )
-            device_offset = device_zero + device_id * stride
-            expected_host[host_offset : host_offset + payload] = expected[buffer][
-                device_offset : device_offset + payload
-            ]
-    assert torch.equal(host, expected_host)
-
-
-@requires_cuda
-def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
-    module = _load_host_transfer_contract_module()
-    if not module.layer_ready_ptx_supported():
-        pytest.skip("flagged Triton transfers require NVIDIA PTX")
-    geometry = module.build_host_transfer_geometry(
-        rows=(
-            (0, 0, 0, 16, 16, 0, 1, 8),
-            (0, 0, 8, 16, 16, 8, 1, 8),
-        ),
-        layer_slices=((0, 1), (1, 0), (1, 1)),
-        group_packing=(1,),
-        host_lcm_block_bytes=16,
-        num_host_lcm_blocks=8,
-        num_device_lcm_blocks=4,
-        num_device_buffers=1,
-    )
-    host = torch.arange(128, dtype=torch.uint8).pin_memory()
-    device = torch.full((64,), 0xA5, dtype=torch.uint8, device="cuda")
-    workspaces = [module.HostTransferWorkspace() for _ in range(3)]
-    initialized = [torch.cuda.Event() for _ in workspaces]
-    finished = [torch.cuda.Event() for _ in workspaces]
-    stream = torch.cuda.Stream()
-    compute = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        bound = geometry.bind(device.device, non_blocking=True)
-    snapshots = []
-    try:
-        for generation in range(7):
-            slot = generation % len(workspaces)
-            workspace = workspaces[slot]
-            if generation >= len(workspaces):
-                finished[slot].synchronize()
-            num_blocks, _ = workspace.load_block_transfers(
-                ((0, 1, generation + 1),), geometry=geometry
-            )
-            # Reusing the destination also waits for the prior consumer reads.
-            stream.wait_stream(compute)
-            with torch.cuda.stream(stream):
-                torch.cuda._sleep(5_000_000)
-                workspace.commit_block_transfers(
-                    num_blocks, device.device, non_blocking=True
-                )
-                flags = workspace.prepare_layer_ready(3, device.device)
-                initialized[slot].record(stream)
-                module.transfer_cache_blocks(
-                    "h2d",
-                    (device,),
-                    host,
-                    bound,
-                    workspace,
-                    stream,
-                    num_blocks=num_blocks,
-                    geometry_offset=0,
-                    num_geometry_rows=2,
-                    backend="triton",
-                    layer_ready_flags=flags,
-                    grid_cap=2,
-                )
-                finished[slot].record(stream)
-            with torch.cuda.stream(compute):
-                compute.wait_event(initialized[slot])
-                module.wait_layer_ready(flags, 0)
-                first = device[16:24].clone()
-                module.wait_layer_ready(flags, 1)
-                module.wait_layer_ready(flags, 2)
-                second = device[24:32].clone()
-                snapshots.append((first, second))
-    except RuntimeError as error:
-        if (
-            module._triton_is_unavailable(error)
-            or "not device-mapped" in str(error).lower()
-        ):
-            pytest.skip(str(error))
-        raise
-    compute.synchronize()
-    stream.synchronize()
-    for generation, (first, second) in enumerate(snapshots):
-        offset = generation * 16
-        assert torch.equal(first.cpu(), host[offset : offset + 8])
-        assert torch.equal(second.cpu(), host[offset + 8 : offset + 16])
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "npu") or not torch.npu.is_available(),
-    reason="requires an Ascend NPU",
-)
-def test_cache_ranges_dma_round_trip_across_multiple_device_buffers_npu():
-    transfer_cache_ranges = (
-        _load_host_transfer_contract_module()._transfer_cache_ranges
-    )
-
-    first = torch.arange(64, dtype=torch.int32, device="npu:0").to(torch.uint8)
-    second = torch.arange(48, dtype=torch.bfloat16, device="npu:0")
-    second_bytes = second.view(torch.uint8)
-
-    host = torch.zeros(96, dtype=torch.uint8, pin_memory=True)
-    ranges = ((0, 8, 0, 24), (1, 16, 48, 32))
-
-    stream = torch.npu.Stream()
-    stream.wait_stream(torch.npu.current_stream())
-
-    transfer_cache_ranges("d2h", (first, second), host, ranges, stream)
-    stream.synchronize()
-
-    assert torch.equal(host[0:24], first[8:32].cpu())
-    assert torch.equal(host[48:80], second_bytes[16:48].cpu())
-
-    host[0:24].fill_(7)
-    host[48:80].fill_(9)
-
-    transfer_cache_ranges("h2d", (first, second), host, ranges, stream)
-    stream.synchronize()
-
-    assert torch.equal(
-        first[8:32].cpu(),
-        torch.full((24,), 7, dtype=torch.uint8),
-    )
-    assert torch.equal(
-        second_bytes[16:48].cpu(),
-        torch.full((32,), 9, dtype=torch.uint8),
-    )
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "npu") or not torch.npu.is_available(),
-    reason="requires an Ascend NPU",
-)
-def test_block_transfer_round_trip_npu():
-    module = _load_host_transfer_contract_module()
-
-    # Reuse the existing geometry and block mapping.
-    geometry = _sample_geometry(module)
-    workspace = module.HostTransferWorkspace()
-
-    transfers = (
-        (1, 3, 2),
-        (0, 5, 4),
-        (0, 2, 1),
-        (1, 7, 1),
-    )
-
-    num_blocks, _ = workspace.load_block_transfers(
-        transfers,
-        geometry=geometry,
-    )
-
-    # Allocate real NPU buffers and initialize them from CPU tensors.
-    sizes = (1024, 16384)
-    device_buffers = []
-
-    for size in sizes:
-        cpu_data = (
-            torch.arange(size, dtype=torch.int32)
-            .remainder(251)
-            .to(torch.uint8)
-        )
-        device_data = torch.empty(
-            size,
-            dtype=torch.uint8,
-            device="npu:0",
-        )
-        device_data.copy_(cpu_data)
-        device_buffers.append(device_data)
-
-    host = torch.empty(
-        geometry.host_lcm_block_bytes * geometry.num_host_lcm_blocks,
-        dtype=torch.uint8,
-        pin_memory=True,
-    )
-
-    stream = torch.npu.Stream()
-    stream.wait_stream(torch.npu.current_stream())
-
-    ranges = module._make_block_ranges(
-        geometry,
-        workspace,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=geometry.num_field_rows,
-    )
-
-    # D2H: real Block-level Device -> Host transfer.
-    module.transfer_cache_blocks(
-        "d2h",
-        device_buffers,
-        host,
-        geometry,
-        workspace,
-        stream,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=geometry.num_field_rows,
-        backend="auto",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    stream.synchronize()
-
-    for buffer_index, device_offset, host_offset, num_bytes in ranges:
-        assert torch.equal(
-            host[host_offset : host_offset + num_bytes],
-            device_buffers[buffer_index][
-                device_offset : device_offset + num_bytes
-            ].cpu(),
-        )
-
-    print("NPU Block D2H: PASSED")
-
-    # Destroy the original Device contents to prove H2D restoration.
-    for buffer in device_buffers:
-        buffer.zero_()
-
-    torch.npu.synchronize()
-
-    # H2D: real Block-level Host -> Device restoration.
-    module.transfer_cache_blocks(
-        "h2d",
-        device_buffers,
-        host,
-        geometry,
-        workspace,
-        stream,
-        num_blocks=num_blocks,
-        geometry_offset=0,
-        num_geometry_rows=geometry.num_field_rows,
-        backend="auto",
-        grid_cap=None,
-        layer_ready_flags=None,
-    )
-
-    stream.synchronize()
-
-    for buffer_index, device_offset, host_offset, num_bytes in ranges:
-        assert torch.equal(
-            device_buffers[buffer_index][
-                device_offset : device_offset + num_bytes
-            ].cpu(),
-            host[host_offset : host_offset + num_bytes],
-        )
-
-    print("NPU Block H2D: PASSED")
-    print("NPU Block Transfer Round Trip: PASSED")
-
-
+import threading
+import time
 import unittest
+from concurrent.futures import Future
+from contextlib import nullcontext
+from importlib import import_module, util
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, Mock, call, patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+# Pure Python, no runtime dependencies: the knobs of an L2-only executor.
+from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
+
+NO_POOL = RetractionPoolRequest(
+    host_gb=0.0, ratio=0.0, max_retracted_requests=0, tail_lcm_blocks_per_request=0
+)
+
+
+class _LoadEvents(SimpleNamespace):
+    def set_completion(self, event):
+        self.layer_done_events[:] = [event] * len(self.layer_done_events)
 
 
 def _replicated_contract(layout, *, num_lcm_blocks=None):
@@ -1560,19 +71,1760 @@ class _SyntheticPool:
         self.load_tracker = tracker
 
 
-from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
-NO_POOL = RetractionPoolRequest(
-    host_gb=0.0, ratio=0.0, max_retracted_requests=0, tail_lcm_blocks_per_request=0
-)
+def _load_executor_module_without_triton(*, force_isolated=False):
+    """Load executor orchestration when optional Triton is not installed."""
+
+    # Keep real dependencies outside the temporary sys.modules snapshot.
+    # Otherwise the first isolated load removes psutil again on exit.
+    import_module("psutil")
+
+    if not force_isolated:
+        executor_name = "tokenspeed.runtime.cache.l2.executor"
+        if executor_name in sys.modules or util.find_spec("tokenspeed_triton"):
+            return import_module("tokenspeed.runtime.cache.l2.executor")
+    host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
+    host_transfer.HostTransferWorkspace = Mock
+    host_transfer.build_host_transfer_geometry = Mock()
+    host_transfer.transfer_cache_blocks = Mock()
+    host_transfer.wait_layer_ready = Mock()
+    ownership = ModuleType("tokenspeed.runtime.cache.transfer.ownership")
+    ownership.BlockOwnerTranslation = Mock
+    lanes = ModuleType("tokenspeed.runtime.cache.transfer.lanes")
+    lanes.CompletionQueue = Mock
+    lanes.HostTransferLane = Mock
+    lanes.build_transfer_geometry = Mock()
+    lanes.check_host_memory = Mock()
+    lanes.load_stream_priority = Mock(return_value=None)
+    lanes.new_cache_stream = Mock()
+    scheduler = ModuleType("tokenspeed_scheduler")
+
+    class Cache:
+        class WriteBackOp:
+            pass
+
+        class LoadBackOp:
+            pass
+
+        class PrefetchOp:
+            pass
+
+        class WriteBackDoneEvent:
+            pass
+
+        class LoadBackDoneEvent:
+            def __init__(self, op_id):
+                self.op_id = op_id
+
+        class PrefetchDoneEvent:
+            def __init__(self, op_id, landed_pages):
+                self.op_id = op_id
+                self.landed_pages = landed_pages
+
+    scheduler.Cache = Cache
+    layerwise_load = ModuleType("tokenspeed.runtime.cache.l2.layerwise_load")
+    layerwise_load.LayerwiseLoadTracker = Mock
+    storage = ModuleType("tokenspeed.runtime.cache.l2.storage")
+    storage.HostCacheStorage = Mock
+    storage.compute_host_lcm_block_bytes = Mock(return_value=1)
+    layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
+    layout.combine_cache_transfer_layouts = lambda target, draft, group_ids=None: (
+        target if draft is None else draft
+    )
+    forward_step = ModuleType("tokenspeed.runtime.execution.forward_step")
+    forward_step.get_is_capture_mode = Mock(return_value=False)
+    runtime_utils = ModuleType("tokenspeed.runtime.utils")
+    runtime_utils.get_colorful_logger = Mock(return_value=Mock())
+    runtime_utils.get_device_module = Mock(return_value=Mock())
+    fake_modules = {
+        "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
+        "tokenspeed_scheduler": scheduler,
+        "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
+        "tokenspeed.runtime.cache.l2.storage": storage,
+        "tokenspeed.runtime.cache.transfer.lanes": lanes,
+        "tokenspeed.runtime.cache.transfer.layout": layout,
+        "tokenspeed.runtime.cache.transfer.ownership": ownership,
+        "tokenspeed.runtime.execution.forward_step": forward_step,
+        "tokenspeed.runtime.utils": runtime_utils,
+    }
+    executor_path = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "python",
+            "tokenspeed",
+            "runtime",
+            "cache",
+            "l2",
+            "executor.py",
+        )
+    )
+    spec = util.spec_from_file_location("_isolated_l2_executor", executor_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load isolated executor from {executor_path}")
+    executor_module = util.module_from_spec(spec)
+    with patch.dict(sys.modules, fake_modules, clear=False):
+        spec.loader.exec_module(executor_module)
+    return executor_module
 
 
-class NPUCompactLayoutRoundTripTest(unittest.TestCase):
-    """Real Ascend NPU round-trip tests for the Host cache executor."""
+class CacheEventPayloadTest(unittest.TestCase):
+    def setUp(self):
+        try:
+            from tokenspeed_scheduler import Cache
 
+            from tokenspeed.runtime.engine.scheduler_utils import (
+                cache_event_from_payload,
+                cache_event_to_payload,
+                pop_common_cache_event_payloads,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+        self.Cache = Cache
+        self.from_payload = cache_event_from_payload
+        self.to_payload = cache_event_to_payload
+        self.pop_common = pop_common_cache_event_payloads
+
+    def test_cache_completion_payload_round_trips_load_back_and_prefetch(self):
+        write_back = self.Cache.WriteBackDoneEvent()
+        write_back.op_id = 7
+        write_payload = self.to_payload(write_back)
+        self.assertEqual(write_payload, {"kind": "WriteBackDoneEvent", "op_id": 7})
+
+        # A load-back lands or does not happen: the ACK carries no outcome.
+        load_back = self.Cache.LoadBackDoneEvent(8)
+        load_payload = self.to_payload(load_back)
+        self.assertEqual(load_payload, {"kind": "LoadBackDoneEvent", "op_id": 8})
+        restored = self.from_payload(load_payload)
+        self.assertIsInstance(restored, self.Cache.LoadBackDoneEvent)
+        self.assertEqual(int(restored.op_id), 8)
+
+        # An L3 prefetch's ACK carries the pages it landed, replica-converged.
+        prefetch = self.Cache.PrefetchDoneEvent(9, 3)
+        prefetch_payload = self.to_payload(prefetch)
+        self.assertEqual(
+            prefetch_payload,
+            {"kind": "PrefetchDoneEvent", "op_id": 9, "landed_pages": 3},
+        )
+        restored = self.from_payload(prefetch_payload)
+        self.assertIsInstance(restored, self.Cache.PrefetchDoneEvent)
+        self.assertEqual((int(restored.op_id), int(restored.landed_pages)), (9, 3))
+        with self.assertRaises(KeyError):
+            self.from_payload({"kind": "PrefetchDoneEvent", "op_id": 9})
+        self.assertEqual(
+            self.pop_common([[load_payload], [dict(load_payload)]]), [load_payload]
+        )
+
+
+def _lanes_module():
+    """The shared Host-transfer lane module the L2 write path delegates to."""
+    return import_module("tokenspeed.runtime.cache.transfer.lanes")
+
+
+def _identity_owners(num_groups=1, bound=64):
+    """A replicated (shard 1) owner translation: local ids are scheduler ids."""
+    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+    return BlockOwnerTranslation(
+        shard_counts=[1] * num_groups,
+        device_virtual_counts=[bound] * num_groups,
+        host_virtual_counts=[bound] * num_groups,
+        rank=0,
+    )
+
+
+class GroupAwareWireTest(unittest.TestCase):
+    def _executor_module(self):
+        try:
+            return _load_executor_module_without_triton()
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+    def _make_load_executor(
+        self,
+        *,
+        consumers,
+        layer_slices,
+        backend="auto",
+        device_rows=None,
+        load_stream=None,
+    ):
+        executor_module = self._executor_module()
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
+        )
+        executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
+        executor._ready_load_acks = []
+        executor._completions = _lanes_module().CompletionQueue()
+        executor._load_poisoned = False
+        executor.l3_store = None
+        executor._l3_prefetch_lane = None
+        executor._prefetch_jobs = {}
+        executor._prefetch_acks = []
+        executor._l3_prefetch_timeout_base_s = 10.0
+        executor._l3_prefetch_timeout_per_page_s = 0.0
+        executor._l3_prefetch_batch_pages = 2
+        executor.load_stream = object() if load_stream is None else load_stream
+        executor.transfer_backend = backend
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(
+            buffers=(SimpleNamespace(device=device),),
+            consumers=consumers,
+        )
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        geometry = SimpleNamespace(
+            layer_slices=layer_slices,
+            device_rows=device_rows,
+            num_field_rows=sum(count for _, count in layer_slices),
+        )
+        executor._transfer_geometry = geometry
+        workspace = MagicMock()
+        workspace.load_block_transfers.return_value = (1, (0, 1))
+        workspace.prepare_backend.return_value = SimpleNamespace(
+            uses_device_tables=device_rows is not None,
+            layer_ready=device_rows is not None,
+        )
+        executor._load_workspaces = (workspace,)
+        return executor_module, executor, device, geometry, workspace
+
+    def test_hybrid_state_access_waits_for_layer_load(self):
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+                HybridKDATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+                HybridMHATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        for pool_type in (HybridMHATokenToKVPool, HybridKDATokenToKVPool):
+            with self.subTest(pool_type=pool_type.__name__):
+                tracker = Mock()
+                pool = pool_type.__new__(pool_type)
+                pool.layerwise_load_tracker = tracker
+                pool._state_buffers_by_layer = {3: ("conv", "recurrent")}
+                if pool_type is HybridMHATokenToKVPool:
+                    pool._state_layer_ids = (3,)
+
+                self.assertEqual(pool.get_component(3, "conv_state"), "conv")
+                tracker.wait_for_layer.assert_called_once_with(3)
+
+    def test_pool_transfer_layout_matches_scheduler_group_order(self):
+        try:
+            from cache_pool_test_utils import MinimalCacheView
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        pool = MinimalCacheView.__new__(MinimalCacheView)
+        pool.layer_num = 2
+        pool._field_layer_offset = 0
+        # The arena owns the buffer, the field views and the published specs;
+        # the pool only answers for them.
+        pool.arena = SimpleNamespace(
+            buffer=object(),
+            cache_group_specs=(
+                SimpleNamespace(group_id="state"),
+                SimpleNamespace(group_id="full"),
+            ),
+        )
+        pool.arena.plan = SimpleNamespace(
+            num_lcm_blocks=4,
+            planes=(
+                SimpleNamespace(
+                    plane_id="shared",
+                    bytes_per_lcm_block=4096,
+                    arena_offset_bytes=0,
+                ),
+            ),
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=32,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    cache_blocks_per_lcm_block=1,
+                ),
+            ),
+            fields=(
+                SimpleNamespace(
+                    group_id="full",
+                    field_id="layer.1.k",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=128,
+                    payload_bytes=128,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    field_id="layer.0.state",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=4096,
+                    payload_bytes=4096,
+                ),
+            ),
+        )
+
+        layout = pool.cache_transfer_layout()
+
+        self.assertEqual(
+            tuple(group.group_id for group in layout.groups),
+            ("state", "full"),
+        )
+
+    def test_submit_load_backs_clears_layerwise_waits_without_load(self):
+        HostCacheExecutor = self._executor_module().HostCacheExecutor
+
+        tracker = Mock()
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._load_trackers = [(tracker, 1)]
+        executor._load_poisoned = False
+        executor.block_owners = _identity_owners()
+
+        executor.submit_load_backs([], prerequisite_stream=object())
+
+        tracker.set_consumers.assert_called_once_with(-1)
+
+    def _prefetch_executor(self, *, batch_pages=2, timeout_base_s=10.0, rank=0):
+        """A bare executor with the prefetch lane's state and a mock L3 store."""
+        module = _load_executor_module_without_triton(force_isolated=True)
+        executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
+        executor.attn_tp_rank = 0
+        executor._ack_lock = threading.Lock()
+        executor._ready_load_acks = []
+        executor._completions = _lanes_module().CompletionQueue()
+        executor._backup_futures = []
+        executor._backup_poll_failed = False
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor._l3_prefetch_lane = None
+        executor._prefetch_jobs = {}
+        executor._prefetch_acks = []
+        executor._l3_prefetch_timeout_base_s = timeout_base_s
+        executor._l3_prefetch_timeout_per_page_s = 0.0
+        executor._l3_prefetch_batch_pages = batch_pages
+        executor.block_owners = _identity_owners(num_groups=2)
+        return module, executor
+
+    @staticmethod
+    def _prefetch_op(module, op_id, pages, *, groups=(0,)):
+        """One prefetch op of ``pages`` prefix pages, page-major, one row per group."""
+        ops_module = import_module("tokenspeed.runtime.cache.transfer.ops")
+        rows = []
+        for page in range(pages):
+            for group in groups:
+                rows.append(
+                    ops_module.PrefetchRow(
+                        group_id=group,
+                        host_page=1 + page * len(groups) + groups.index(group),
+                        content_hash=f"h{page}",
+                        page_offset=page,
+                        page_index=page,
+                    )
+                )
+        return ops_module.PrefetchOp(
+            op_id=op_id,
+            request_id=f"r{op_id}",
+            first_page=0,
+            num_pages=pages,
+            rows=tuple(rows),
+        )
+
+    @staticmethod
+    def _settle(executor, op_id):
+        for _ in range(200):
+            progress = executor.l3_prefetch_progress()
+            if progress[op_id][0]:
+                return progress[op_id][1]
+            time.sleep(0.01)
+        raise AssertionError("prefetch lane did not finish")
+
+    def test_prefetch_lane_lands_the_prefix_before_the_first_missing_page(self):
+        """The lane fetches in prefix order, a batch at a time, and stops at
+        the first page with a missing object (in any group); the landed count
+        is a prefix length and the op is acknowledged once, with the count
+        the hooks converged, never before they did."""
+        module, executor = self._prefetch_executor(batch_pages=2)
+        fetched = []
+
+        def prefetch(pages):
+            fetched.append([page[2] for page in pages])
+            # Page 2's second group is missing: pages 0 and 1 land.
+            return [not (page[2] == "h2" and page[0] == 1) for page in pages]
+
+        executor.l3_store.prefetch.side_effect = prefetch
+        op = self._prefetch_op(module, 5, 4, groups=(0, 1))
+        executor.submit_prefetches([op, SimpleNamespace()])
+        landed = self._settle(executor, 5)
+
+        self.assertEqual(landed, 2)
+        # Batches of two pages (four rows); the fetch stopped after the batch
+        # holding the miss, so pages 3 were never requested.
+        self.assertEqual(fetched, [["h0", "h0", "h1", "h1"], ["h2", "h2", "h3", "h3"]])
+        self.assertEqual(executor.poll_results(), [])
+        executor.complete_l3_prefetch(5, 1)  # the replica's common prefix
+        (ack,) = executor.poll_results()
+        self.assertEqual(
+            (type(ack).__name__, ack.op_id, ack.landed_pages),
+            ("PrefetchDoneEvent", 5, 1),
+        )
+        self.assertEqual(executor.poll_results(), [])
+        self.assertEqual(executor.l3_prefetch_progress(), {})
+        with self.assertRaises(KeyError):
+            executor.complete_l3_prefetch(5, 1)
+
+    def test_prefetch_lane_stops_at_the_deadline_and_on_a_backend_fault(self):
+        module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=1.0)
+        # The lane reads the clock once for the deadline and once before each
+        # batch: the first batch is on time, the second past the deadline.
+        clock = iter([0.0, 0.0] + [10.0] * 100)
+        executor.l3_store.prefetch.side_effect = lambda pages: [True] * len(pages)
+        with patch.object(module.time, "monotonic", side_effect=lambda: next(clock)):
+            executor.submit_prefetches([self._prefetch_op(module, 1, 3)])
+            self.assertEqual(self._settle(executor, 1), 1)
+        self.assertEqual(executor.l3_store.prefetch.call_count, 1)
+
+        executor.l3_store.prefetch.side_effect = [[True], RuntimeError("rpc")]
+        executor.submit_prefetches([self._prefetch_op(module, 2, 3)])
+        self.assertEqual(self._settle(executor, 2), 1)
+        with self.assertRaises(ValueError):
+            executor.complete_l3_prefetch(2, 4)  # more than the op has
+        executor.complete_l3_prefetch(1, 1)
+        executor.complete_l3_prefetch(2, 0)
+        self.assertEqual(
+            [(ack.op_id, ack.landed_pages) for ack in executor.poll_results()],
+            [(1, 1), (2, 0)],
+        )
+
+    def test_prefetch_submission_validates_the_plan_before_starting_any_job(self):
+        module, executor = self._prefetch_executor()
+        ops_module = import_module("tokenspeed.runtime.cache.transfer.ops")
+        with self.assertRaisesRegex(ValueError, "duplicate prefetch op id"):
+            executor.submit_prefetches(
+                [self._prefetch_op(module, 1, 1), self._prefetch_op(module, 1, 2)]
+            )
+        with self.assertRaisesRegex(ValueError, "carries no pages"):
+            executor.submit_prefetches(
+                [
+                    ops_module.PrefetchOp(
+                        op_id=3, request_id="r", first_page=0, num_pages=0, rows=()
+                    )
+                ]
+            )
+        # Rows must stay inside [first_page, first_page + num_pages) and in order.
+        op = self._prefetch_op(module, 5, 2)
+        bad = ops_module.PrefetchOp(
+            op_id=5, request_id="r5", first_page=1, num_pages=2, rows=op.rows
+        )
+        with self.assertRaisesRegex(ValueError, "outside .* or out of order"):
+            executor.submit_prefetches([bad])
+        executor.l3_store = None
+        with self.assertRaisesRegex(RuntimeError, "no storage backend"):
+            executor.submit_prefetches([self._prefetch_op(module, 4, 1)])
+        self.assertEqual(executor._prefetch_jobs, {})
+
+    def test_a_prefetch_that_raised_lands_nothing_and_is_logged_once(self):
+        """The hooks poll progress every round until the replica converges;
+        a failed lane job is an error once, not a traceback per round."""
+        module, executor = self._prefetch_executor(batch_pages=1)
+        executor._l3_prefetch_batch_pages = 0  # range(..., 0): the job raises
+        module.logger.error.reset_mock()  # the isolated module's logger is a Mock
+        executor.submit_prefetches([self._prefetch_op(module, 9, 2)])
+        self.assertEqual(self._settle(executor, 9), 0)
+        for _ in range(3):
+            self.assertEqual(executor.l3_prefetch_progress(), {9: (True, 0)})
+        module.logger.error.assert_called_once()
+        self.assertIn("prefetch 9 (r9) raised", module.logger.error.call_args.args[0])
+        # Draining never re-raises a failed job: it has left the lane.
+        executor._wait_l3_prefetches()
+        executor.complete_l3_prefetch(9, 0)
+
+    def test_the_weight_version_swap_drains_in_flight_prefetches(self):
+        """A prefetch gets under the key prefix, so the prefix is not swapped
+        while one is on the lane -- the backups were already drained; the
+        prefetches are too, a failed one included."""
+        module, executor = self._prefetch_executor()
+        executor._l3_prefix_for_weight_version = lambda version: f"prefix/{version}"
+        pending, failed = Future(), Future()
+        executor._prefetch_jobs = {
+            1: module._PrefetchJob(request_id="r1", num_pages=2, future=pending),
+            2: module._PrefetchJob(request_id="r2", num_pages=2, future=failed),
+        }
+        failed.set_exception(RuntimeError("rpc"))
+        swapped = threading.Event()
+        executor.l3_store.set_key_prefix.side_effect = lambda prefix: swapped.set()
+        worker = threading.Thread(
+            target=executor.set_l3_weight_version, args=("v2",), daemon=True
+        )
+        worker.start()
+        self.assertFalse(swapped.wait(0.05), "swapped while a prefetch was in flight")
+        pending.set_result(2)
+        self.assertTrue(swapped.wait(5.0))
+        worker.join(5.0)
+        executor.l3_store.set_key_prefix.assert_called_once_with("prefix/v2")
+
+    def _owner_executor(self, *, num_groups=2):
+        """An executor with replicated (identity) owner translations only."""
+        executor_module = self._executor_module()
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
+        )
+        executor.block_owners = _identity_owners(num_groups)
+        executor.snapshot_block_owners = _identity_owners(num_groups)
+        return executor_module, executor
+
+    def test_submit_preserves_group_identity(self):
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+
+        _, executor = self._owner_executor()
+        op_ids = []
+        transfers = []
+        executor._append_transfers(
+            [7],
+            [[0, 1]],
+            [[5, 5]],
+            [[9, 9]],
+            collected_op_ids=op_ids,
+            transfers=transfers,
+            source_is_device=True,
+            tier=HostTier.L2,
+        )
+        self.assertEqual(op_ids, [7])
+        self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
+
+    def test_sharded_rows_keep_only_this_ranks_owned_blocks_on_both_ends(self):
+        # A group dealt to two owners: rank r keeps the rows whose Device AND
+        # Host block have residue r, in local ids; the op is collected even
+        # when every row belongs to the other rank.
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+        from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+        executor_module = self._executor_module()
+        for rank, expected in ((0, [(0, 1, 2), (0, 2, 3)]), (1, [(0, 1, 1)])):
+            with self.subTest(rank=rank):
+                executor = executor_module.HostCacheExecutor.__new__(
+                    executor_module.HostCacheExecutor
+                )
+                executor.block_owners = BlockOwnerTranslation(
+                    shard_counts=[2],
+                    device_virtual_counts=[9],
+                    host_virtual_counts=[9],
+                    rank=rank,
+                )
+                op_ids: list[int] = []
+                transfers: list[tuple[int, int, int]] = []
+                executor._append_transfers(
+                    [7],
+                    [[0, 0, 0]],
+                    [[1, 3, 2]],
+                    [[3, 5, 2]],
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
+                    source_is_device=True,
+                    tier=HostTier.L2,
+                )
+                self.assertEqual(op_ids, [7])
+                self.assertEqual(transfers, expected)
+        with self.assertRaisesRegex(ValueError, "residue class"):
+            executor._append_transfers(
+                [8],
+                [[0]],
+                [[1]],
+                [[2]],
+                collected_op_ids=[],
+                transfers=[],
+                source_is_device=True,
+                tier=HostTier.L2,
+            )
+
+    def _make_write_executor(self, executor_module):
+        HostCacheExecutor = executor_module.HostCacheExecutor
+        lanes_module = _lanes_module()
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor.attn_tp_rank = 0
+        device = SimpleNamespace(type="cuda")
+        executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        executor.transfer_backend = "auto"
+        executor._completions = lanes_module.CompletionQueue()
+        executor.block_owners = _identity_owners()
+        executor.write_stream = Mock(name="write_stream")
+        # Real lanes over mocked workspaces: the staging discipline under test
+        # is the lane's, the executor only picks which lane an op rides.
+        for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
+            with patch.object(lanes_module, "HostTransferWorkspace", Mock):
+                lane = lanes_module.HostTransferLane()
+            lane.workspace.load_block_transfers.return_value = (1, (0, 1))
+            lane.workspace.prepare_backend.return_value = SimpleNamespace(
+                uses_device_tables=True,
+            )
+            setattr(executor, lane_name, lane)
+        executor._transfer_geometry = SimpleNamespace(
+            device_rows=object(),
+            layer_slices=((0, 2), (2, 1)),
+            num_field_rows=3,
+        )
+        return executor, device
+
+    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, device = self._make_write_executor(executor_module)
+        lane = executor._pinned_write_lane
+        prerequisite_stream = object()
+        finish = Mock()
+        metadata_done = Mock()
+        # Every stream the executor touches is one the caller named; the
+        # thread's current stream is never consulted.
+        no_current_stream = patch.object(
+            lanes_module.device_module,
+            "current_stream",
+            side_effect=AssertionError("current stream must not be consulted"),
+        )
+
+        with (
+            no_current_stream,
+            patch.object(lanes_module.device_module, "stream") as stream_ctx,
+            patch.object(
+                lanes_module.device_module,
+                "Event",
+                side_effect=[metadata_done, finish],
+            ),
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+        ):
+            fence = executor._start_writing(
+                [7],
+                [(0, 5, 9)],
+                backup_pages=[],
+                lane=lane,
+                prerequisite_stream=prerequisite_stream,
+            )
+
+        # On the write stream, ordered after the prerequisite stream the
+        # caller named (the forwards that wrote the pages). The completion
+        # event is handed back so a stream-ordered submission can fence the
+        # caller's fence stream on it; a pinned one simply drops it.
+        self.assertIs(fence, finish)
+        executor.write_stream.wait_stream.assert_called_once_with(prerequisite_stream)
+        # The address tables and the metadata H2D are enqueued on the write
+        # stream too: the payload kernel reads them from that stream, and a
+        # copy left on the caller's stream would land behind the wait above
+        # with nothing ordering it ahead of the kernel.
+        stream_ctx.assert_called_once_with(executor.write_stream)
+        lane.workspace.load_block_transfers.assert_called_once_with(
+            [(0, 5, 9)], geometry=executor._transfer_geometry
+        )
+        lane.workspace.commit_block_transfers.assert_called_once_with(
+            1, device, non_blocking=True
+        )
+        transfer.assert_called_once_with(
+            "d2h",
+            executor.layout.buffers,
+            executor.host_storage.host_buffer,
+            executor._transfer_geometry,
+            lane.workspace,
+            executor.write_stream,
+            num_blocks=1,
+            geometry_offset=0,
+            num_geometry_rows=3,
+            backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
+        )
+        finish.record.assert_called_once_with(executor.write_stream)
+        metadata_done.record.assert_called_once_with(executor.write_stream)
+        metadata_done.synchronize.assert_not_called()
+        self.assertIsNone(executor._ordered_write_lane.metadata_done)
+
+        # Refill must wait for metadata, but must never wait for payload ACK;
+        # the upload and its retirement event sit inside the write-stream
+        # context, the payload launch names the stream explicitly.
+        for ready in (False, True):
+            with self.subTest(metadata_ready=ready):
+                metadata_done.reset_mock()
+                metadata_done.query.return_value = ready
+                order = Mock()
+                order.attach_mock(metadata_done.synchronize, "retire")
+                order.attach_mock(lane.workspace.load_block_transfers, "refill")
+                order.attach_mock(lane.workspace.commit_block_transfers, "upload")
+                order.attach_mock(metadata_done.record, "record")
+                with (
+                    no_current_stream,
+                    patch.object(lanes_module.device_module, "stream") as stream_ctx,
+                    patch.object(
+                        lanes_module.device_module, "Event", return_value=finish
+                    ),
+                    patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+                ):
+                    order.attach_mock(stream_ctx, "stream")
+                    order.attach_mock(transfer, "payload")
+                    executor._start_writing(
+                        [8],
+                        [(0, 6, 10)],
+                        backup_pages=[],
+                        lane=lane,
+                        prerequisite_stream=prerequisite_stream,
+                    )
+                names = [call[0] for call in order.mock_calls]
+                self.assertEqual(
+                    names,
+                    ([] if ready else ["retire"])
+                    + [
+                        "refill",
+                        "stream",
+                        "stream().__enter__",
+                        "upload",
+                        "record",
+                        "stream().__exit__",
+                        "payload",
+                    ],
+                )
+                finish.synchronize.assert_not_called()
+
+    def test_submit_write_backs_fences_only_stream_ordered_ops(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, _ = self._make_write_executor(executor_module)
+        fence_stream = Mock(name="fence_stream")
+        prerequisite = object()
+        ordered_finish = Mock(name="ordered_finish")
+        pinned_finish = Mock(name="pinned_finish")
+        events = iter(
+            [
+                Mock(name="ordered_meta"),
+                ordered_finish,
+                Mock(name="pinned_meta"),
+                pinned_finish,
+            ]
+        )
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12, 13]
+                self.group_ids = [[0], [0], [0]]
+                self.src_pages = [[1], [2], [3]]
+                self.dst_pages = [[5], [6], [7]]
+                self.source_pinned = [True, False, True]
+                self.content_hashes = [["pinned-a"], ["ordered"], ["pinned-b"]]
+                self.page_offsets = [[0], [1], [2]]
+
+        with (
+            patch.object(
+                executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+            ),
+            patch.object(
+                lanes_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(
+                lanes_module.device_module,
+                "Event",
+                side_effect=lambda: next(events),
+            ),
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
+        ):
+            executor.submit_write_backs(
+                [WriteBackOp()],
+                prerequisite_stream=prerequisite,
+                fence_stream=fence_stream,
+            )
+
+        # The stream-ordered op (12) launches first and the fence stream the
+        # caller named waits on ITS completion only; the pinned ops (11, 13)
+        # follow on the write stream and fence nothing -- the scheduler holds
+        # their sources.
+        ordered_lane = executor._ordered_write_lane
+        pinned_lane = executor._pinned_write_lane
+        ordered_lane.workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 6)], geometry=executor._transfer_geometry
+        )
+        pinned_lane.workspace.load_block_transfers.assert_called_once_with(
+            [(0, 1, 5), (0, 3, 7)], geometry=executor._transfer_geometry
+        )
+        self.assertEqual(
+            [call.args[4] for call in transfer.call_args_list],
+            [ordered_lane.workspace, pinned_lane.workspace],
+        )
+        fence_stream.wait_event.assert_called_once_with(ordered_finish)
+        pending = executor._completions._pending
+        self.assertEqual(
+            [(finish, ack.kind, ack.op_ids) for finish, ack in pending],
+            [
+                (ordered_finish, executor_module._AckKind.WRITE_BACK, [12]),
+                (pinned_finish, executor_module._AckKind.WRITE_BACK, [11, 13]),
+            ],
+        )
+        self.assertEqual(
+            [ack.backup_pages for _, ack in pending],
+            [[(0, 6, "ordered", 1)], [(0, 5, "pinned-a", 0), (0, 7, "pinned-b", 2)]],
+        )
+        self.assertEqual(
+            executor.write_stream.wait_stream.call_args_list,
+            [call(prerequisite), call(prerequisite)],
+            "both launches order behind the prerequisite stream the caller named",
+        )
+
+    def test_mixed_write_lanes_ack_only_their_completed_l3_put(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, _ = self._make_write_executor(executor_module)
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor._write_done = lambda op_id: op_id
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        ordered_pages = [(0, 6, "ordered", 0)]
+        pinned_pages = [(0, 5, "pinned", 0)]
+
+        def backup(pages):
+            index = 0 if pages == ordered_pages else 1
+            self.assertEqual(pages, [ordered_pages, pinned_pages][index])
+            started[index].set()
+            if not release[index].wait(timeout=10):
+                raise TimeoutError("mixed-lane PUT gate was not released")
+            return [True]
+
+        executor.l3_store.backup.side_effect = backup
+        ordered_finish = Mock()
+        pinned_finish = Mock()
+        ordered_finish.query.return_value = False
+        pinned_finish.query.return_value = False
+        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12]
+                self.group_ids = [[0], [0]]
+                self.src_pages = [[1], [2]]
+                self.dst_pages = [[5], [6]]
+                self.source_pinned = [True, False]
+                self.content_hashes = [["pinned"], ["ordered"]]
+                self.page_offsets = [[0], [0]]
+
+        def poll_until_ready():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                ready = executor.poll_results()
+                if ready:
+                    return ready
+                time.sleep(0.001)
+            self.fail("completed L3 PUT did not produce its ACK")
+
+        try:
+            with (
+                patch.object(executor_module.Cache, "WriteBackOp", WriteBackOp),
+                patch.object(lanes_module.device_module, "current_stream"),
+                patch.object(
+                    lanes_module.device_module,
+                    "stream",
+                    return_value=nullcontext(),
+                ),
+                patch.object(
+                    lanes_module.device_module,
+                    "Event",
+                    side_effect=lambda: next(events),
+                ),
+                patch.object(lanes_module, "transfer_cache_blocks"),
+            ):
+                executor.submit_write_backs(
+                    [WriteBackOp()],
+                    prerequisite_stream=object(),
+                    fence_stream=Mock(),
+                )
+
+            self.assertEqual(executor.poll_results(), [])
+            executor.l3_store.backup.assert_not_called()
+            ordered_finish.query.return_value = True
+            pinned_finish.query.return_value = True
+            self.assertEqual(executor.poll_results(), [])
+            self.assertTrue(started[0].wait(timeout=10))
+            self.assertFalse(started[1].is_set())
+            self.assertEqual(executor.poll_results(), [])
+
+            release[0].set()
+            self.assertTrue(started[1].wait(timeout=10))
+            self.assertEqual(poll_until_ready(), [12])
+            self.assertEqual(executor.poll_results(), [])
+            self.assertEqual(
+                [op_ids for _, op_ids, _ in executor._backup_futures], [[11]]
+            )
+
+            release[1].set()
+            self.assertEqual(poll_until_ready(), [11])
+            self.assertEqual(executor.poll_results(), [])
+            self.assertEqual(executor._backup_futures, [])
+            executor.l3_store.backup.assert_has_calls(
+                [call(ordered_pages), call(pinned_pages)]
+            )
+        finally:
+            for gate in release:
+                gate.set()
+            if executor._l3_workers is not None:
+                executor._l3_workers.shutdown(wait=True)
+
+    def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        executor, _ = self._make_write_executor(executor_module)
+        fence_stream = Mock(name="fence_stream")
+        prerequisite = object()
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11]
+                self.group_ids = [[0]]
+                self.src_pages = [[1]]
+                self.dst_pages = [[5]]
+                self.source_pinned = [True]
+                self.content_hashes = [[""]]
+                self.page_offsets = [[0]]
+
+        with (
+            patch.object(
+                executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+            ),
+            patch.object(
+                lanes_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(lanes_module.device_module, "Event", side_effect=Mock),
+            patch.object(lanes_module, "transfer_cache_blocks"),
+        ):
+            executor.submit_write_backs(
+                [WriteBackOp()],
+                prerequisite_stream=prerequisite,
+                fence_stream=fence_stream,
+            )
+
+        fence_stream.wait_event.assert_not_called()
+        executor._ordered_write_lane.workspace.load_block_transfers.assert_not_called()
+
+    def test_submit_write_backs_rejects_ragged_guard_vector(self):
+        executor_module = self._executor_module()
+        executor, _ = self._make_write_executor(executor_module)
+        prerequisite = object()
+
+        class WriteBackOp:
+            def __init__(self):
+                self.op_ids = [11, 12]
+                self.group_ids = [[0], [0]]
+                self.src_pages = [[1], [2]]
+                self.dst_pages = [[5], [6]]
+                self.source_pinned = [True]
+
+        with patch.object(
+            executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
+        ):
+            with self.assertRaises(ValueError):
+                executor.submit_write_backs(
+                    [WriteBackOp()],
+                    prerequisite_stream=prerequisite,
+                    fence_stream=object(),
+                )
+
+    def test_cache_operation_without_transfers_is_refused(self):
+        # An op is acknowledged by its copy's completion event, so one with
+        # nothing to copy could never be acknowledged; the scheduler never
+        # emits one, and the runtime refuses rather than inventing an ack.
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+
+        _, executor = self._owner_executor()
+        for source_is_device in (True, False):
+            with self.subTest(source_is_device=source_is_device):
+                op_ids: list[int] = []
+                transfers: list[tuple[int, int, int]] = []
+                with self.assertRaisesRegex(ValueError, "operation 11 carries no"):
+                    executor._append_transfers(
+                        [7, 11],
+                        [[0], []],
+                        [[1], []],
+                        [[5], []],
+                        collected_op_ids=op_ids,
+                        transfers=transfers,
+                        source_is_device=source_is_device,
+                        tier=HostTier.L2,
+                    )
+
+    def test_loadback_logs_non_empty_batch(self):
+        executor_module, executor, _, geometry, workspace = self._make_load_executor(
+            consumers=(("field",),),
+            layer_slices=((0, 1),),
+            backend="dma",
+            device_rows=None,
+        )
+        workspace.load_block_transfers.return_value = (2, (0, 2))
+        load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 1)]
+        finish = Mock()
+        prerequisite_stream = object()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
+            patch.object(executor_module.logger, "info") as log_info,
+        ):
+            executor._start_loading(
+                [9],
+                [(0, 2, 1), (0, 5, 4)],
+                prerequisite_stream=prerequisite_stream,
+            )
+
+        workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 1), (0, 5, 4)], geometry=geometry
+        )
+        workspace.commit_block_transfers.assert_not_called()
+        transfer.assert_called_once()
+        log_info.assert_called_once_with(
+            "[L2] load started: operations=1 blocks=2",
+        )
+        # The load orders after the prerequisite stream the caller named --
+        # the one that zeroed its destinations -- not after the current stream.
+        load_events.start_event.record.assert_called_once_with(prerequisite_stream)
+        load_events.start_event.wait.assert_called_once_with(executor.load_stream)
+
+    def test_resolved_transport_selects_events_even_with_device_geometry(self):
+        for uses_device_tables in (False, True):
+            with self.subTest(uses_device_tables=uses_device_tables):
+                module, executor, _, _, workspace = self._make_load_executor(
+                    consumers=(("first",), ("second",)),
+                    layer_slices=((0, 1), (1, 1)),
+                    device_rows="bound geometry",
+                )
+                workspace.prepare_backend.return_value = SimpleNamespace(
+                    uses_device_tables=uses_device_tables, layer_ready=False
+                )
+                events = _LoadEvents(start_event=Mock(), layer_done_events=[None, None])
+                tracker = Mock()
+                tracker.begin_load.return_value = 0
+                tracker.event_sets = [events]
+                executor._load_trackers = [(tracker, 2)]
+                with (
+                    patch.object(module, "get_is_capture_mode", return_value=False),
+                    patch.object(
+                        module.device_module, "stream", return_value=nullcontext()
+                    ),
+                    patch.object(
+                        module.device_module, "Event", side_effect=[Mock(), Mock()]
+                    ),
+                    patch.object(module, "transfer_cache_blocks") as transfer,
+                ):
+                    executor._start_loading(
+                        [9], [(0, 1, 1)], prerequisite_stream=object()
+                    )
+                self.assertEqual(
+                    workspace.commit_block_transfers.call_count, int(uses_device_tables)
+                )
+                workspace.prepare_layer_ready.assert_not_called()
+                self.assertIsNone(events.layer_ready_flags)
+                self.assertEqual(transfer.call_count, 2)
+                self.assertTrue(
+                    all(event is not None for event in events.layer_done_events)
+                )
+
+    def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        HostCacheExecutor = executor_module.HostCacheExecutor
+
+        device = SimpleNamespace(type="cuda")
+        buffer = SimpleNamespace(device=device)
+        fields = {
+            "target.0.k": SimpleNamespace(
+                field_id="target.0.k",
+                device_buffer_index=0,
+                device_block_zero_offset_bytes=8,
+                block_stride_bytes=16,
+                payload_bytes=12,
+            ),
+            "target.2.state": SimpleNamespace(
+                field_id="target.2.state",
+                device_buffer_index=1,
+                device_block_zero_offset_bytes=32,
+                block_stride_bytes=64,
+                payload_bytes=20,
+            ),
+            "draft.0.k": SimpleNamespace(
+                field_id="draft.0.k",
+                device_buffer_index=0,
+                device_block_zero_offset_bytes=48,
+                block_stride_bytes=16,
+                payload_bytes=12,
+            ),
+        }
+        combined_layout = SimpleNamespace(
+            num_lcm_blocks=11,
+            buffers=(buffer, SimpleNamespace(device=device)),
+            groups=(
+                SimpleNamespace(
+                    group_id="state",
+                    cache_blocks_per_lcm_block=4,
+                    fields=(fields["target.2.state"],),
+                ),
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=8,
+                    fields=(fields["target.0.k"], fields["draft.0.k"]),
+                ),
+            ),
+            # Target layers precede draft layers, and empty layers are retained.
+            consumers=(
+                ("target.0.k",),
+                (),
+                ("target.2.state",),
+                ("draft.0.k",),
+            ),
+        )
+        target_layout = SimpleNamespace(
+            consumers=(("target.0.k",), (), ("target.2.state",))
+        )
+        draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
+        target_pool = Mock()
+        target_pool.cache_transfer_layout.return_value = target_layout
+        target_pool.arena.runtime_contract = _replicated_contract(
+            combined_layout, num_lcm_blocks=11
+        )
+        draft_pool = Mock()
+        draft_pool.cache_transfer_layout.return_value = draft_layout
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(20, 24),
+            host_field_offsets=((0,), (0, 12)),
+            host_lcm_block_bytes=192,
+            num_host_lcm_blocks=3,
+            host_buffer="host",
+        )
+        unbound_geometry = Mock()
+        bound_geometry = object()
+        unbound_geometry.bind.return_value = bound_geometry
+        trackers = []
+
+        def make_tracker(consumer_count):
+            tracker = Mock()
+            tracker.event_sets = [object(), object()]
+            trackers.append((consumer_count, tracker))
+            return tracker
+
+        with (
+            patch.object(
+                executor_module,
+                "combine_cache_transfer_layouts",
+                return_value=combined_layout,
+            ),
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=storage.host_lcm_block_bytes,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(
+                lanes_module.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(available=10**12),
+            ),
+            patch.object(
+                executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
+            ),
+            patch.object(executor_module, "new_cache_stream", return_value="load"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                lanes_module,
+                "build_host_transfer_geometry",
+                return_value=unbound_geometry,
+            ) as build_geometry,
+        ):
+            executor = HostCacheExecutor(
+                target_pool,
+                draft_pool=draft_pool,
+                l2_tier=True,
+                host_ratio=1.0,
+                host_size_gb=0,
+                snapshot_pool=NO_POOL,
+                slot_state_exporters=None,
+                io_backend="kernel",
+                attn_tp_rank=0,
+                kvp_rank=0,
+            )
+
+        build_geometry.assert_called_once_with(
+            rows=(
+                (1, 0, 8, 16, 24, 0, 8, 12),
+                (0, 1, 32, 64, 20, 0, 4, 20),
+                (1, 0, 48, 16, 24, 12, 8, 12),
+            ),
+            layer_slices=((0, 1), (1, 0), (1, 1), (2, 1)),
+            group_packing=(4, 8),
+            host_lcm_block_bytes=192,
+            num_host_lcm_blocks=3,
+            num_device_lcm_blocks=11,
+            num_device_buffers=2,
+        )
+        unbound_geometry.bind.assert_called_once_with(device, non_blocking=False)
+        self.assertIs(executor._transfer_geometry, bound_geometry)
+        self.assertEqual([count for count, _ in trackers], [3, 1])
+
+    def test_direct_and_npu_init_keep_geometry_on_the_host(self):
+        executor_module = self._executor_module()
+        lanes_module = _lanes_module()
+        HostCacheExecutor = executor_module.HostCacheExecutor
+
+        pool = Mock()
+        pool.arena.runtime_contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            virtual_block_counts={"group": 3},
+        )
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(16,),
+            host_field_offsets=((0,),),
+            host_lcm_block_bytes=64,
+            num_host_lcm_blocks=2,
+            host_buffer="host",
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+
+        with (
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=storage.host_lcm_block_bytes,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(
+                lanes_module.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(available=10**12),
+            ),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(executor_module, "new_cache_stream", return_value="load"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                lanes_module,
+                "build_host_transfer_geometry",
+                side_effect=lambda **_kwargs: SimpleNamespace(
+                    device_rows=None,
+                    bind=Mock(),
+                ),
+            ) as build_geometry,
+        ):
+            for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
+                with self.subTest(io_backend=io_backend, device_type=device_type):
+                    field = SimpleNamespace(
+                        field_id="field",
+                        device_buffer_index=0,
+                        device_block_zero_offset_bytes=0,
+                        block_stride_bytes=16,
+                        payload_bytes=16,
+                    )
+                    layout = SimpleNamespace(
+                        num_lcm_blocks=2,
+                        buffers=(
+                            SimpleNamespace(device=SimpleNamespace(type=device_type)),
+                        ),
+                        groups=(
+                            SimpleNamespace(
+                                group_id="group",
+                                cache_blocks_per_lcm_block=1,
+                                fields=(field,),
+                            ),
+                        ),
+                        consumers=(("field",),),
+                    )
+                    pool.cache_transfer_layout.return_value = layout
+                    executor = HostCacheExecutor(
+                        pool,
+                        l2_tier=True,
+                        host_ratio=1.0,
+                        host_size_gb=0,
+                        snapshot_pool=NO_POOL,
+                        slot_state_exporters=None,
+                        io_backend=io_backend,
+                        attn_tp_rank=0,
+                        kvp_rank=0,
+                    )
+                    self.assertIsNone(executor._transfer_geometry.device_rows)
+                    executor._transfer_geometry.bind.assert_not_called()
+
+        self.assertEqual(build_geometry.call_count, 2)
+
+    def test_optional_dependency_shim_restores_existing_modules(self):
+        protected_names = (
+            "tokenspeed_kernel.ops.kvcache.host_transfer",
+            "tokenspeed_scheduler",
+            "tokenspeed.runtime.cache.l2.layerwise_load",
+            "tokenspeed.runtime.cache.l2.storage",
+            "tokenspeed.runtime.cache.transfer.lanes",
+            "tokenspeed.runtime.cache.transfer.layout",
+            "tokenspeed.runtime.cache.transfer.ownership",
+            "tokenspeed.runtime.execution.forward_step",
+            "tokenspeed.runtime.utils",
+            "tokenspeed.runtime.cache.l2.executor",
+        )
+        sentinels = {name: ModuleType(name) for name in protected_names}
+
+        with patch.dict(sys.modules, sentinels, clear=False):
+            isolated = _load_executor_module_without_triton(force_isolated=True)
+
+            self.assertIsNot(isolated, sentinels[protected_names[-1]])
+            for name, sentinel in sentinels.items():
+                self.assertIs(sys.modules[name], sentinel)
+
+    def test_two_isolated_loads_preserve_imported_real_modules(self):
+        # psutil is a real dependency of the shared lane module; the isolated
+        # loader imports it ahead of its sys.modules snapshot so the snapshot's
+        # restore cannot drop it again.
+        first = _load_executor_module_without_triton(force_isolated=True)
+        first_psutil = sys.modules["psutil"]
+        self.assertIs(_lanes_module().psutil, first_psutil)
+
+        second = _load_executor_module_without_triton(force_isolated=True)
+
+        self.assertIsNot(first, second)
+        self.assertIs(sys.modules["psutil"], first_psutil)
+        self.assertIs(_lanes_module().psutil, first_psutil)
+
+    def test_loadback_commits_block_ids_once_and_launches_one_flagged_kernel(self):
+        executor_module, executor, device, geometry, workspace = (
+            self._make_load_executor(
+                consumers=(("layer.0",), (), ("layer.2",)),
+                layer_slices=((0, 2), (2, 0), (2, 1)),
+                device_rows=object(),
+            )
+        )
+        flags = Mock()
+        flags.__getitem__ = Mock(return_value=flags)
+        workspace.prepare_layer_ready.return_value = flags
+        load_events = _LoadEvents(
+            start_event=Mock(),
+            layer_done_events=[None, None, None],
+            layer_ready_flags=None,
+            wait_layer_ready=None,
+            layer_ready_init_event=Mock(),
+        )
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 3)]
+        finish = Mock()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(executor_module, "transfer_cache_blocks") as transfer,
+        ):
+            executor._start_loading([9], [(0, 2, 1)], prerequisite_stream=object())
+
+        workspace.load_block_transfers.assert_called_once_with(
+            [(0, 2, 1)], geometry=geometry
+        )
+        workspace.commit_block_transfers.assert_called_once_with(
+            1, device, non_blocking=True
+        )
+        workspace.prepare_layer_ready.assert_called_once_with(3, device)
+        load_events.layer_ready_init_event.record.assert_called_once_with(
+            executor.load_stream
+        )
+        transfer.assert_called_once_with(
+            "h2d",
+            executor.layout.buffers,
+            executor.host_storage.host_buffer,
+            geometry,
+            workspace,
+            executor.load_stream,
+            num_blocks=1,
+            geometry_offset=0,
+            num_geometry_rows=3,
+            backend="auto",
+            layer_ready_flags=flags,
+            grid_cap=None,
+        )
+        finish.record.assert_called_once_with(executor.load_stream)
+        self.assertEqual(load_events.layer_done_events, [finish, finish, finish])
+        self.assertIs(load_events.layer_ready_flags, flags)
+        self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
+        ((pending_finish, ack),) = executor._completions._pending
+        self.assertIs(pending_finish, finish)
+        self.assertEqual(
+            (ack.kind, ack.op_ids), (executor_module._AckKind.LOAD_BACK, [9])
+        )
+
+    def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
+        executor_module, executor, _, _, _ = self._make_load_executor(
+            consumers=(("target.0",), ("target.1",), ("draft.0",)),
+            layer_slices=((0, 1), (1, 1), (2, 1)),
+            device_rows=object(),
+            load_stream=Mock(),
+        )
+        target_events = _LoadEvents(
+            start_event=Mock(),
+            layer_done_events=[Mock(), Mock()],
+            layer_ready_init_event=Mock(),
+        )
+        draft_events = _LoadEvents(
+            start_event=Mock(),
+            layer_done_events=[Mock()],
+            layer_ready_init_event=Mock(),
+        )
+        target_tracker = Mock()
+        target_tracker.begin_load.return_value = 0
+        target_tracker.event_sets = [target_events]
+        draft_tracker = Mock()
+        draft_tracker.begin_load.return_value = 0
+        draft_tracker.event_sets = [draft_events]
+        executor._load_trackers = [(target_tracker, 2), (draft_tracker, 1)]
+        retirement = Mock()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                return_value=retirement,
+            ),
+            patch.object(
+                executor_module,
+                "transfer_cache_blocks",
+                side_effect=RuntimeError("layer launch failed"),
+            ) as transfer,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "layer launch failed"):
+                executor._start_loading([9], [(0, 2, 1)], prerequisite_stream=object())
+
+        self.assertEqual(transfer.call_count, 1)
+        retirement.record.assert_called_once_with(executor.load_stream)
+        self.assertEqual(
+            target_events.layer_done_events,
+            [retirement, retirement],
+        )
+        self.assertEqual(draft_events.layer_done_events, [retirement])
+        executor.load_stream.synchronize.assert_not_called()
+        self.assertEqual(executor._completions._pending, [])
+
+    def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
+        executor_module, executor, _, _, _ = self._make_load_executor(
+            consumers=(("target.0",),),
+            layer_slices=((0, 1),),
+            device_rows=object(),
+            load_stream=Mock(),
+        )
+        load_events = _LoadEvents(
+            start_event=Mock(),
+            layer_done_events=[Mock()],
+            layer_ready_init_event=Mock(),
+        )
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 1)]
+        original_error = RuntimeError("original layer launch failed")
+        retirement = Mock()
+        retirement.record.side_effect = RuntimeError("retirement record failed")
+        executor.load_stream.synchronize.side_effect = RuntimeError(
+            "retirement sync failed"
+        )
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                executor_module.device_module,
+                "stream",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                executor_module.device_module,
+                "Event",
+                return_value=retirement,
+            ),
+            patch.object(
+                executor_module,
+                "transfer_cache_blocks",
+                side_effect=original_error,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                executor._start_loading([9], [(0, 2, 1)], prerequisite_stream=object())
+
+            self.assertIs(raised.exception, original_error)
+            self.assertEqual(str(raised.exception), "original layer launch failed")
+            self.assertTrue(executor._load_poisoned)
+            notes = getattr(raised.exception, "__notes__", ())
+            self.assertTrue(any("retirement record failed" in note for note in notes))
+            self.assertTrue(any("retirement sync failed" in note for note in notes))
+
+            executor.load_stream.synchronize.side_effect = None
+            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                executor._start_loading([10], [(0, 3, 2)], prerequisite_stream=object())
+
+        tracker.begin_load.assert_called_once_with()
+
+
+class L3FlatKvExecutorTest(unittest.TestCase):
+    def test_wait_l3_backups_snapshots_under_lock_and_waits_outside(self):
+        module = _load_executor_module_without_triton(force_isolated=True)
+        lock = threading.Lock()
+        observed = []
+
+        class PendingBackups(list):
+            def __iter__(self):
+                self_test.assertTrue(lock.locked())
+                return super().__iter__()
+
+        def completed():
+            self.assertFalse(lock.locked())
+            observed.append("done")
+
+        self_test = self
+        future = Mock()
+        future.result.side_effect = completed
+        executor = SimpleNamespace(
+            _ack_lock=lock,
+            _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
+        )
+        module.HostCacheExecutor._wait_l3_backups(executor)
+        self.assertEqual(observed, ["done"])
+        future.result.side_effect = RuntimeError("backup failed")
+        with self.assertRaisesRegex(RuntimeError, "backup failed"):
+            module.HostCacheExecutor._wait_l3_backups(executor)
+        self.assertFalse(lock.locked())
+
+    def test_storage_pages_list_the_kept_hashed_rows_by_local_host_id(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        operation = SimpleNamespace(
+            content_hashes=[["h0", "h1", ""]],
+            page_offsets=[[0, 1, 0]],
+            group_ids=[[0, 1, 0]],
+            src_pages=[[3, 4, 9]],
+            dst_pages=[[7, 8, 10]],
+        )
+        # The kept rows name the Host end by local id (the destination a
+        # write-back wrote); an unkeyed row (no content hash) is not backed up.
+        write_pages = HostCacheExecutor._storage_pages(
+            operation, kept_rows=[(0, [(0, 7), (1, 8), (2, 10)])]
+        )
+        self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
+        # Only the rows this rank kept are listed: a KVP peer's row is not.
+        self.assertEqual(
+            HostCacheExecutor._storage_pages(operation, kept_rows=[(0, [(1, 2)])]),
+            [(1, 2, "h1", 1)],
+        )
+
+    def test_poll_results_backs_up_host_pages_asynchronously(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def backup(pages):
+            del pages
+            started.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("L3 backup was not released")
+            return [True]
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = CompletionQueue()
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor.l3_store.backup.side_effect = backup
+        finish = Mock()
+        finish.query.return_value = True
+        executor._completions.push(
+            finish,
+            _Ack(
+                kind=_AckKind.WRITE_BACK,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+            ),
+        )
+
+        first = executor.poll_results()
+        self.assertEqual(first, [])
+        self.assertTrue(started.wait(timeout=2))
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        release.set()
+        deadline = time.monotonic() + 2
+        second = []
+        try:
+            while time.monotonic() < deadline:
+                second = executor.poll_results()
+                if second:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(int(second[0].op_id), 7)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
+
+    def test_backup_failure_does_not_ack_writeback(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = CompletionQueue()
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor._backup_poll_failed = False
+        executor._l3_workers = None
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [False]
+        finish = Mock()
+        finish.query.return_value = True
+        executor._completions.push(
+            finish,
+            _Ack(
+                kind=_AckKind.WRITE_BACK,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+            ),
+        )
+
+        first = None
+        failed = False
+        try:
+            first = executor.poll_results()
+            self.assertEqual(first, [])
+            failed = executor.consume_backup_poll_failure()
+            deadline = time.monotonic() + 2
+            while not failed and time.monotonic() < deadline:
+                self.assertEqual(executor.poll_results(), [])
+                failed = executor.consume_backup_poll_failure()
+                if not failed:
+                    time.sleep(0.01)
+        finally:
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
+        self.assertTrue(failed)
+
+    def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        # A KVP rank that owns none of a load's rows copies nothing, arms no
+        # layer fence and still acknowledges the op (the hooks' replica
+        # intersection waits for the owners).
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._load_poisoned = False
+        executor._completions = CompletionQueue()
+        executor._backup_futures = []
+        executor._load_trackers = [(Mock(), 1)]
+        executor.l3_store = None
+        self.assertIsNone(
+            executor._start_loading([9], [], prerequisite_stream=object())
+        )
+        executor._load_trackers[0][0].begin_load.assert_not_called()
+        events = executor.poll_results()
+        self.assertEqual(
+            [(type(e).__name__, int(e.op_id)) for e in events],
+            [("LoadBackDoneEvent", 9)],
+        )
+
+    def test_shutdown_persists_completed_d2h_before_closing_l3(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = CompletionQueue()
+        executor._completions.push(
+            Mock(),
+            _Ack(
+                kind=_AckKind.WRITE_BACK,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+            ),
+        )
+        executor._backup_futures = []
+        executor._l3_workers = None
+        executor._l3_prefetch_lane = None
+        executor._prefetch_jobs = {}
+        executor._prefetch_acks = []
+        executor.load_stream = Mock()
+        executor.write_stream = Mock()
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [True]
+        default_stream = Mock()
+        with patch.object(
+            executor_module.device_module,
+            "synchronize",
+            side_effect=default_stream.synchronize,
+        ):
+            executor.shutdown()
+
+        default_stream.synchronize.assert_called_once_with()
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        executor.l3_store.close.assert_called_once_with()
+        self.assertEqual(executor._completions._pending, [])
+
+
+class CompactLayoutRoundTripTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-            import torch_npu
 
             import tokenspeed.runtime.cache.l2.executor as executor_module
             from tokenspeed.runtime.cache.transfer.layout import (
@@ -1581,29 +1833,50 @@ class NPUCompactLayoutRoundTripTest(unittest.TestCase):
                 CacheTransferLayout,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs NPU runtime dependencies: {exc}")
-
-        if not hasattr(torch, "npu") or not torch.npu.is_available():
-            self.skipTest("requires an Ascend NPU")
-
-        torch.npu.set_device(0)
-
+            self.skipTest(f"needs runtime dependencies: {exc}")
+        if not torch.cuda.is_available():
+            self.skipTest("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
         self.CacheField = CacheField
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
-    def test_npu_executor_round_trip_restores_compact_layout_byte_exactly(self):
+    def _make_executor(self, layout, *, draft_layout=None, io_backend):
+        pool = _SyntheticPool(layout)
+        draft_pool = (
+            _SyntheticPool(draft_layout, pool.arena)
+            if draft_layout is not None
+            else None
+        )
+        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
+            executor = self.executor_module.HostCacheExecutor(
+                pool,
+                draft_pool=draft_pool,
+                l2_tier=True,
+                host_ratio=1.0,
+                host_size_gb=0,
+                snapshot_pool=NO_POOL,
+                slot_state_exporters=None,
+                io_backend=io_backend,
+                attn_tp_rank=0,
+                kvp_rank=0,
+            )
+        self.addCleanup(executor.shutdown)
+        return executor, pool, draft_pool
+
+    def _single_group_layout(self, buffer, *fields):
+        return self.CacheTransferLayout(
+            4,
+            (self.CacheGroupLayout("full", 1, fields),),
+            (buffer,),
+            tuple((field.field_id,) for field in fields),
+        )
+
+    def test_kernel_executor_round_trip_restores_compact_layout_byte_exactly(self):
         torch = self.torch
-
-        first = torch.full(
-            (128,), 0xCC, dtype=torch.uint8, device="npu:0"
-        )
-        second = torch.full(
-            (128,), 0xCC, dtype=torch.uint8, device="npu:0"
-        )
-
+        first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
         layout = self.CacheTransferLayout(
             num_lcm_blocks=4,
             groups=(
@@ -1618,583 +1891,164 @@ class NPUCompactLayoutRoundTripTest(unittest.TestCase):
                 self.CacheGroupLayout(
                     group_id="state",
                     cache_blocks_per_lcm_block=1,
-                    fields=(
-                        self.CacheField("layer.1.state", 0, 64, 10, 5),
-                    ),
+                    fields=(self.CacheField("layer.1.state", 0, 64, 10, 5),),
                 ),
             ),
             buffers=(first, second),
             consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
         )
 
-        pool = _SyntheticPool(layout)
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
 
-        with patch.object(
-            self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0
-        ):
-            executor = self.executor_module.HostCacheExecutor(
-                pool,
-                draft_pool=None,
-                l2_tier=True,
-                host_ratio=1.0,
-                host_size_gb=0,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
-                io_backend="direct",
-                attn_tp_rank=0,
-                kvp_rank=0,
-            )
-
-        self.addCleanup(executor.shutdown)
-
-        full_k_one = torch.tensor(
-            [0x11, 0x12, 0x13, 0x14], dtype=torch.uint8
-        )
+        # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).
+        full_k_one = torch.tensor([0x11, 0x12, 0x13, 0x14], dtype=torch.uint8)
         full_v_one = torch.tensor(
-            [0x21, 0x22, 0x23, 0x24, 0x25, 0x26],
-            dtype=torch.uint8,
+            [0x21, 0x22, 0x23, 0x24, 0x25, 0x26], dtype=torch.uint8
         )
-        full_k_four = torch.tensor(
-            [0x41, 0x42, 0x43, 0x44], dtype=torch.uint8
-        )
+        full_k_four = torch.tensor([0x41, 0x42, 0x43, 0x44], dtype=torch.uint8)
         full_v_four = torch.tensor(
-            [0x51, 0x52, 0x53, 0x54, 0x55, 0x56],
-            dtype=torch.uint8,
+            [0x51, 0x52, 0x53, 0x54, 0x55, 0x56], dtype=torch.uint8
         )
-        state_three = torch.tensor(
-            [0x71, 0x72, 0x73, 0x74, 0x75],
-            dtype=torch.uint8,
-        )
-
+        state_three = torch.tensor([0x71, 0x72, 0x73, 0x74, 0x75], dtype=torch.uint8)
         first[16:20].copy_(full_k_one)
         second[28:34].copy_(full_v_one)
         first[40:44].copy_(full_k_four)
         second[64:70].copy_(full_v_four)
         first[94:99].copy_(state_three)
+        torch.cuda.synchronize()
 
-        torch.npu.synchronize()
-
-        # D2H: NPU -> pinned Host.
-        executor._start_writing(
+        executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
             backup_pages=[],
-            lane=executor._pinned_write_lane,
-            prerequisite_stream=torch.npu.current_stream(),
+            lane=executor._pinned_write_lane,  # pylint: disable=protected-access
+            prerequisite_stream=torch.cuda.current_stream(),
         )
-
         executor.write_stream.synchronize()
-
         write_results = executor.poll_results()
-        self.assertEqual(
-            [int(event.op_id) for event in write_results], [7]
-        )
+        self.assertEqual([int(event.op_id) for event in write_results], [7])
 
-        # Destroy original Device data.
+        # Destroy every Device byte so stale cache contents cannot make the
+        # H2D half of the round trip pass accidentally.
         first.fill_(0xEE)
         second.fill_(0xEE)
-        torch.npu.synchronize()
+        torch.cuda.synchronize()
 
-        # H2D: pinned Host -> NPU.
-        load_index = executor._start_loading(
+        load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
-            prerequisite_stream=torch.npu.current_stream(),
+            prerequisite_stream=torch.cuda.current_stream(),
         )
-
         self.assertIsNotNone(load_index)
-
         pool.load_tracker.set_consumers(load_index)
         pool.load_tracker.wait_for_layer(0)
         pool.load_tracker.wait_for_layer(1)
-
-        torch.npu.synchronize()
-
+        torch.cuda.synchronize()
         load_results = executor.poll_results()
-        self.assertEqual(
-            [int(event.op_id) for event in load_results], [9]
-        )
-
-        expected_first = torch.full(
-            (128,), 0xEE, dtype=torch.uint8
-        )
-        expected_second = torch.full(
-            (128,), 0xEE, dtype=torch.uint8
-        )
-
+        self.assertEqual([int(event.op_id) for event in load_results], [9])
+        # Hand-derived destination ranges for blocks (full: 2, 5; state: 4).
+        expected_first = torch.full((128,), 0xEE, dtype=torch.uint8)
+        expected_second = torch.full((128,), 0xEE, dtype=torch.uint8)
         expected_first[24:28].copy_(full_k_one)
         expected_second[40:46].copy_(full_v_one)
         expected_first[48:52].copy_(full_k_four)
         expected_second[76:82].copy_(full_v_four)
         expected_first[104:109].copy_(state_three)
-
         self.assertTrue(torch.equal(first.cpu(), expected_first))
         self.assertTrue(torch.equal(second.cpu(), expected_second))
 
-    def test_npu_writeback_ack_waits_for_dma_completion(self):
+    def test_async_write_metadata_reuse_keeps_batches_distinct(self):
         torch = self.torch
-
-        first = torch.full((128,), 0xCC, dtype=torch.uint8, device="npu:0")
-        second = torch.full((128,), 0xCC, dtype=torch.uint8, device="npu:0")
-
-        layout = self.CacheTransferLayout(
-            num_lcm_blocks=4,
-            groups=(
-                self.CacheGroupLayout(
-                    group_id="full",
-                    cache_blocks_per_lcm_block=2,
-                    fields=(
-                        self.CacheField("layer.0.k", 0, 8, 8, 4),
-                        self.CacheField("layer.0.v", 1, 16, 12, 6),
-                    ),
-                ),
-                self.CacheGroupLayout(
-                    group_id="state",
-                    cache_blocks_per_lcm_block=1,
-                    fields=(
-                        self.CacheField("layer.1.state", 0, 64, 10, 5),
-                    ),
-                ),
-            ),
-            buffers=(first, second),
-            consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
+        device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
+        layout = self._single_group_layout(
+            device, self.CacheField("layer.0.k", 0, 8, 8, 4)
         )
-
-        pool = _SyntheticPool(layout)
-
-        with patch.object(
-            self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0
-        ):
-            executor = self.executor_module.HostCacheExecutor(
-                pool,
-                draft_pool=None,
-                l2_tier=True,
-                host_ratio=1.0,
-                host_size_gb=0,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
-                io_backend="direct",
-                attn_tp_rank=0,
-                kvp_rank=0,
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel")
+        for generation in range(3):
+            # Three back-to-back submissions, each with its own Device source
+            # and Host block, with no caller synchronization between them: if
+            # a later batch's block table overwrote an earlier one's before its
+            # payload ran, the wrong pair would be copied. The sources are
+            # distinct on purpose -- a pinned store's source is never rewritten
+            # while its copy is in flight, so the test must not rewrite one
+            # either.
+            for block in range(1, 4):
+                offset = 8 + block * 8
+                device[offset : offset + 4].fill_(generation * 16 + block)
+                executor._start_writing(
+                    [block],
+                    [(0, block, block)],
+                    backup_pages=[],
+                    lane=executor._pinned_write_lane,
+                    prerequisite_stream=torch.cuda.current_stream(),
+                )
+            # The load below has no scheduler ACK to wait for, so order it
+            # behind the copies the way a stream-ordered submission would.
+            torch.cuda.current_stream().wait_stream(executor.write_stream)
+            device.fill_(0xEE)
+            load_index = executor._start_loading(
+                [9],
+                [(0, block, block) for block in range(1, 4)],
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            pool.load_tracker.set_consumers(load_index)
+            pool.load_tracker.wait_for_layer(0)
+            torch.cuda.current_stream().synchronize()
+            for block in range(1, 4):
+                offset = 8 + block * 8
+                self.assertEqual(
+                    device[offset : offset + 4].tolist(),
+                    [generation * 16 + block] * 4,
+                )
+            self.assertEqual(
+                sorted(int(event.op_id) for event in executor.poll_results()),
+                [1, 2, 3, 9],
             )
 
-        self.addCleanup(executor.shutdown)
-
-        first[16:20] = torch.tensor(
-            [0x11, 0x12, 0x13, 0x14], dtype=torch.uint8
+    def test_real_transfer_restores_merged_owner_draft_subset_once(self):
+        torch = self.torch
+        device = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        target_fields = (
+            self.CacheField("layer.0.k", 0, 8, 8, 4),
+            self.CacheField("layer.1.k", 0, 48, 8, 4),
         )
-        second[28:34] = torch.tensor(
-            [0x21, 0x22, 0x23, 0x24, 0x25, 0x26],
-            dtype=torch.uint8,
-        )
-        first[40:44] = torch.tensor(
-            [0x41, 0x42, 0x43, 0x44], dtype=torch.uint8
-        )
-        second[64:70] = torch.tensor(
-            [0x51, 0x52, 0x53, 0x54, 0x55, 0x56],
-            dtype=torch.uint8,
-        )
-        first[94:99] = torch.tensor(
-            [0x71, 0x72, 0x73, 0x74, 0x75],
-            dtype=torch.uint8,
+        target_layout = self._single_group_layout(device, *target_fields)
+        draft_layout = self._single_group_layout(device, target_fields[1])
+        executor, target_pool, draft_pool = self._make_executor(
+            target_layout, draft_layout=draft_layout, io_backend="kernel"
         )
 
-        torch.npu.synchronize()
-
-        prerequisite_stream = torch.npu.Stream()
-        scratch = torch.zeros(
-            (4096, 4096), dtype=torch.float32, device="npu:0"
-        )
-        prerequisite_done = torch.npu.Event()
-
-        with torch.npu.stream(prerequisite_stream):
-            for _ in range(2048):
-                scratch.add_(1.0)
-            prerequisite_done.record(prerequisite_stream)
-
-        self.assertFalse(
-            prerequisite_done.query(),
-            "Prerequisite workload finished before WriteBack submission.",
-        )
-
-        executor._start_writing(
-            [11],
-            [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
+        device[16:20].fill_(0x11)
+        device[56:60].fill_(0x12)
+        torch.cuda.synchronize()
+        executor._start_writing(  # pylint: disable=protected-access
+            [7],
+            [(0, 1, 1)],
             backup_pages=[],
             lane=executor._pinned_write_lane,
-            prerequisite_stream=prerequisite_stream,
+            prerequisite_stream=torch.cuda.current_stream(),
         )
+        torch.cuda.synchronize()
+        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
 
-        early_results = executor.poll_results()
-
-        self.assertFalse(
-            prerequisite_done.query(),
-            "Prerequisite completed during submission or polling; "
-            "the test did not observe a pending write-back.",
+        device.fill_(0xEE)
+        torch.cuda.synchronize()
+        load_index = executor._start_loading(  # pylint: disable=protected-access
+            [9],
+            [(0, 2, 1)],
+            prerequisite_stream=torch.cuda.current_stream(),
         )
-
-        self.assertEqual(
-            early_results,
-            [],
-            "WriteBack ACK arrived before prerequisite/D2H completion.",
-        )
-
-        prerequisite_stream.synchronize()
-        self.assertTrue(prerequisite_done.query())
-
-        executor.write_stream.synchronize()
-
-        write_results = executor.poll_results()
-
-        self.assertEqual(len(write_results), 1)
-        self.assertEqual(
-            type(write_results[0]).__name__,
-            "WriteBackDoneEvent",
-        )
-        self.assertEqual(int(write_results[0].op_id), 11)
-
-        self.assertEqual(executor.poll_results(), [])
-
-    def test_npu_writeback_ack_releases_real_scheduler_blocks(self):
-        import tokenspeed_scheduler as ts
-
-        from tokenspeed.runtime.engine.scheduler_utils import (
-            advance_scheduler,
-            cache_ops_from_plan,
-            make_config,
-            make_extend_result_event,
-        )
-
-        torch = self.torch
-
-        # A. Construct the real Scheduler with the same shared LCM pool.
-        groups = [
-            ts.CacheGroupConfig(
-                group_id="full",
-                block_granularity=2,
-                total_pages=64,
-                attn_kind=ts.AttnKind.Full,
-            ),
-            ts.CacheGroupConfig(
-                group_id="swa",
-                block_granularity=2,
-                total_pages=64,
-                attn_kind=ts.AttnKind.SlidingWindow,
-                sliding_window_tokens=4,
-            ),
-        ]
-
-        scheduler = ts.Scheduler(
-            make_config(
-                num_device_pages=64,
-                max_scheduled_tokens=64,
-                max_batch_size=8,
-                prefix_granularity=2,
-                num_host_pages=7,
-                disable_l2_cache=False,
-                enable_l3_storage=False,
-                role="fused",
-                num_snapshot_pages=1,
-                max_retracted_requests=0,
-                l3_prefetch_min_pages=0,
-                disable_prefix_cache=True,
-                cache_groups=groups,
-            )
-        )
-
-        def available():
-            return {
-                group: scheduler.cache_group_available_pages(group)
-                for group in ("full", "swa")
-            }
-
-        free_initial = available()
-
-        device_capacity = scheduler.empty_lcm_blocks()
-        host_capacity = scheduler.host_pool_free_blocks()
-
-        def log_capacity(stage):
-            device_empty = scheduler.empty_lcm_blocks()
-            host_free = scheduler.host_pool_free_blocks()
-            print(f"[cache-capacity] {stage} device_used={device_capacity - device_empty} device_empty={device_empty} device_available={scheduler.available_lcm_blocks()} host_used={host_capacity - host_free} host_free={host_free} host_cached={scheduler.host_pool_cached_blocks()}", flush=True)
-
-        log_capacity("initial")
-
-        self.assertEqual(
-            free_initial["full"],
-            free_initial["swa"],
-            "Both group queries should expose the shared LCM pool count.",
-        )
-
-        # B. Submit r1 and complete prefill.
-        spec = ts.RequestSpec()
-        spec.request_id = "r1"
-        spec.tokens = list(range(1, 9))
-        spec.max_new_tokens = 1
-
-        scheduler.submit_requests([spec])
-        scheduler.next_execution_plan()
-
-        advance_scheduler(
-            scheduler,
-            [make_extend_result_event("r1", [9001])],
-        )
-
-        # C. Capture the actual six-page WriteBack.
-        finalize = scheduler.next_execution_plan()
-        ops = cache_ops_from_plan(finalize)
-
-        self.assertEqual(len(ops), 1)
-
-        wb = ops[0]
-        op_id = int(wb.op_ids[0])
-
-        group_ids = list(wb.group_ids[0])
-        src_pages = list(wb.src_pages[0])
-        dst_pages = list(wb.dst_pages[0])
-
-        self.assertEqual(group_ids, [0, 0, 0, 0, 1, 1])
-        self.assertEqual(src_pages, [1, 2, 3, 4, 8, 9])
-        self.assertEqual(dst_pages, [1, 2, 3, 4, 5, 6])
-        self.assertEqual(list(wb.source_pinned), [True])
-        self.assertEqual(len(src_pages), 6)
-
-        # Only submit a decode completion if r1 was actually scheduled.
-        scheduled_ids = [
-            request_id
-            for forward in finalize.forward
-            for request_id in forward.request_ids
-        ]
-
-        self.assertIn(
-            "r1",
-            scheduled_ids,
-            "Expected r1 to have a scheduled forward in the finalize plan.",
-        )
-
-        advance_scheduler(
-            scheduler,
-            [make_extend_result_event("r1", [9002])],
-        )
-
-        finish = ts.ForwardEvent.Finish()
-        finish.request_id = "r1"
-        advance_scheduler(scheduler, [finish])
-
-        finish_plan = scheduler.next_execution_plan()
-        finish_ops = cache_ops_from_plan(finish_plan)
-
-        self.assertFalse(
-            any(type(op).__name__ == "WriteBackOp" for op in finish_ops),
-            "Finish must not emit another WriteBack.",
-        )
-
-        free_before_ack = available()
-        print(f"Initial: {free_initial}, before ACK: {free_before_ack}")
-
-        # D. Construct matching Ascend transfer layout.
-        first = torch.full(
-            (256,), 0xCC, dtype=torch.uint8, device="npu:0"
-        )
-        second = torch.full(
-            (256,), 0xCC, dtype=torch.uint8, device="npu:0"
-        )
-
-        layout = self.CacheTransferLayout(
-            num_lcm_blocks=64,
-            groups=(
-                self.CacheGroupLayout(
-                    group_id="full",
-                    cache_blocks_per_lcm_block=1,
-                    fields=(
-                        self.CacheField("layer.0.k", 0, 8, 8, 4),
-                        self.CacheField("layer.0.v", 1, 16, 12, 6),
-                    ),
-                ),
-                self.CacheGroupLayout(
-                    group_id="swa",
-                    cache_blocks_per_lcm_block=1,
-                    fields=(
-                        self.CacheField("layer.1.state", 0, 64, 10, 5),
-                    ),
-                ),
-            ),
-            buffers=(first, second),
-            consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
-        )
-
-        pool = _SyntheticPool(layout)
-
-        with patch.object(
-            self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0
-        ):
-            executor = self.executor_module.HostCacheExecutor(
-                pool,
-                draft_pool=None,
-                l2_tier=True,
-                host_ratio=7 / 64,
-                host_size_gb=0,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
-                io_backend="direct",
-                attn_tp_rank=0,
-                kvp_rank=0,
-            )
-
-        self.addCleanup(executor.shutdown)
-
-        storage = executor.host_storage
-        self.assertIsNotNone(storage)
-        self.assertEqual(storage.num_host_lcm_blocks, 7)
-
-        # E. Fill the actual Device source blocks with identifiable bytes.
-        expected = {}
-
-        for group_id, src_id, dst_id in zip(
-            group_ids, src_pages, dst_pages
-        ):
-            if group_id == 0:
-                k_value = 0x10 + src_id
-                v_value = 0x20 + src_id
-
-                first_offset = 8 + src_id * 8
-                second_offset = 16 + src_id * 12
-
-                first[first_offset:first_offset + 4].fill_(k_value)
-                second[second_offset:second_offset + 6].fill_(v_value)
-
-                expected[(group_id, dst_id, 0)] = torch.full(
-                    (4,), k_value, dtype=torch.uint8
-                )
-                expected[(group_id, dst_id, 1)] = torch.full(
-                    (6,), v_value, dtype=torch.uint8
-                )
-            else:
-                state_value = 0x70 + src_id
-                state_offset = 64 + src_id * 10
-
-                first[state_offset:state_offset + 5].fill_(state_value)
-
-                expected[(group_id, dst_id, 0)] = torch.full(
-                    (5,), state_value, dtype=torch.uint8
-                )
-
-        torch.npu.synchronize()
-
-        transfers = [
-            (int(group), int(src), int(dst))
-            for group, src, dst in zip(
-                group_ids, src_pages, dst_pages
-            )
-        ]
-
-        # F. Create a real pending prerequisite on Ascend.
-        prerequisite_stream = torch.npu.Stream()
-
-        scratch = torch.zeros(
-            (4096, 4096),
-            dtype=torch.float32,
-            device="npu:0",
-        )
-
-        prerequisite_done = torch.npu.Event()
-
-        with torch.npu.stream(prerequisite_stream):
-            for _ in range(2048):
-                scratch.add_(1.0)
-            prerequisite_done.record(prerequisite_stream)
-
-        self.assertFalse(
-            prerequisite_done.query(),
-            "Prerequisite finished before submission; retry with a larger workload.",
-        )
-
-        executor._start_writing(
-            [op_id],
-            transfers,
-            backup_pages=[],
-            lane=executor._pinned_write_lane,
-            prerequisite_stream=prerequisite_stream,
-        )
-
-        early_results = executor.poll_results()
-
-        self.assertFalse(
-            prerequisite_done.query(),
-            "Pending prerequisite window disappeared during polling.",
-        )
-
-        self.assertEqual(
-            early_results,
-            [],
-            "WriteBack ACK arrived before prerequisite/D2H completion.",
-        )
-
-        for group in ("full", "swa"):
-            self.assertEqual(
-                scheduler.cache_group_available_pages(group),
-                free_before_ack[group],
-                f"{group}: Scheduler blocks must remain pinned during DMA.",
-            )
-
-        # G. Complete D2H, but do NOT ACK Scheduler yet.
-        prerequisite_stream.synchronize()
-        self.assertTrue(prerequisite_done.query())
-
-        executor.write_stream.synchronize()
-
-        # H. Verify every Host destination field byte-for-byte.
-        for (group_id, dst_id, field_index), expected_bytes in expected.items():
-            base = storage.host_block_offset(group_id, dst_id)
-
-            field_offset = storage.host_field_offsets[group_id][field_index]
-
-            start = base + field_offset
-            end = start + expected_bytes.numel()
-
-            actual = storage.host_buffer[start:end]
-
-            self.assertTrue(
-                torch.equal(actual.cpu(), expected_bytes),
-                (
-                    f"Host data mismatch: group={group_id}, "
-                    f"dst={dst_id}, field_index={field_index}"
-                ),
-            )
-
-        # DMA completion alone must not release Scheduler blocks.
-        for group in ("full", "swa"):
-            self.assertEqual(
-                scheduler.cache_group_available_pages(group),
-                free_before_ack[group],
-            )
-
-        # I. Obtain the actual runtime ACK and deliver it to Scheduler.
-        write_results = executor.poll_results()
-
-        self.assertEqual(len(write_results), 1)
-        self.assertEqual(
-            type(write_results[0]).__name__,
-            "WriteBackDoneEvent",
-        )
-        self.assertEqual(int(write_results[0].op_id), op_id)
-
-        log_capacity("before_ack")
-        lcm_before = scheduler.available_lcm_blocks()
-        advance_scheduler(scheduler, write_results)
-        lcm_after = scheduler.available_lcm_blocks()
-        log_capacity("after_ack")
-        print(f"Available LCM blocks: {lcm_before} -> {lcm_after}")
-
-        free_after_ack = available()
-        released = {
-            group: free_after_ack[group] - free_before_ack[group]
-            for group in ("full", "swa")
-        }
-        print(f"After ACK: {free_after_ack}, available-page deltas: {released}")
-        self.assertEqual(
-            lcm_after - lcm_before, 6,
-            f"Expected six pages to become available after WriteBackDone({op_id})",
-        )
-
-        self.assertEqual(executor.poll_results(), [])
+        self.assertIsNotNone(load_index)
+        target_pool.load_tracker.set_consumers(load_index)
+        draft_pool.load_tracker.set_consumers(load_index)
+        target_pool.load_tracker.wait_for_layer(0)
+        target_pool.load_tracker.wait_for_layer(1)
+        draft_pool.load_tracker.wait_for_layer(0)
+        torch.cuda.synchronize()
+        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [9])
+        self.assertEqual(device[24:28].tolist(), [0x11] * 4)
+        self.assertEqual(device[64:68].tolist(), [0x12] * 4)
+
+
+if __name__ == "__main__":
+    unittest.main()
