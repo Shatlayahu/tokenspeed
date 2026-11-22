@@ -504,6 +504,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
+        .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks)
+        .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
         .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
              "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "

@@ -58,6 +58,7 @@ import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
+from time import perf_counter as _l2_transfer_clock
 from typing import NamedTuple
 
 import torch
@@ -118,6 +119,11 @@ class _AckKind(Enum):
     RESTORE = "RestoreDone"
 
 
+class _L2TransferStats(NamedTuple):
+    payload_bytes: int
+    submitted_at: float
+
+
 class _Ack(NamedTuple):
     """The payload of one in-flight Host copy on the completion queue.
 
@@ -130,6 +136,7 @@ class _Ack(NamedTuple):
     kind: _AckKind
     op_ids: list[int]
     backup_pages: list[StoragePage]
+    transfer_stats: _L2TransferStats | None = None
 
 
 class _PrefetchJob:
@@ -1269,6 +1276,15 @@ class HostCacheExecutor:
             return False
         return l3_store.rotate_namespace()
 
+    def _l2_transfer_stats(self, transfers) -> _L2TransferStats:
+        # Each local transfer row copies the payload fields of one group block.
+        group_bytes = tuple(
+            sum(field.payload_bytes for field in group.fields)
+            for group in self.layout.groups
+        )
+        payload_bytes = sum(group_bytes[group_id] for group_id, _, _ in transfers)
+        return _L2TransferStats(payload_bytes, _l2_transfer_clock())
+
     def _start_writing(
         self,
         op_ids: Sequence[int],
@@ -1291,6 +1307,7 @@ class HostCacheExecutor:
                 f"[L2] writeback started: operations={len(op_ids):d} blocks="
                 f"{len(transfers):d} pinned={lane is self._pinned_write_lane!s}",
             )
+        stats = self._l2_transfer_stats(transfers)
         finish = lane.start_d2h(
             transfers,
             device_buffers=self.layout.buffers,
@@ -1306,6 +1323,7 @@ class HostCacheExecutor:
                 kind=_AckKind.WRITE_BACK,
                 op_ids=op_ids,
                 backup_pages=backup_pages,
+                transfer_stats=stats,
             ),
         )
         return finish
@@ -1345,6 +1363,7 @@ class HostCacheExecutor:
         # makes the H2D copy wait for that zeroing; per-layer ready flags
         # (Triton) or events (DMA) then keep model consumers from reading
         # partially restored cache state.
+        stats = self._l2_transfer_stats(transfers)
         load_index = None
         finish = None
         flags = None
@@ -1447,7 +1466,12 @@ class HostCacheExecutor:
                 raise RuntimeError("cache transfer layout has no layer consumers")
             self._completions.push(
                 finish,
-                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, backup_pages=[]),
+                _Ack(
+                    kind=_AckKind.LOAD_BACK,
+                    op_ids=op_ids,
+                    backup_pages=[],
+                    transfer_stats=stats,
+                ),
             )
             return load_index
         except BaseException as original_error:
@@ -1497,6 +1521,19 @@ class HostCacheExecutor:
             )
             self._prefetch_acks.clear()
         for ack in self._completions.pop_ready():
+            stats = ack.transfer_stats
+            if stats is not None:
+                direction = "D2H" if ack.kind is _AckKind.WRITE_BACK else "H2D"
+                elapsed_ms = (_l2_transfer_clock() - stats.submitted_at) * 1000
+                logger.info(
+                    "[L2 transfer] direction=%s attn_tp_rank=%d op_ids=%s "
+                    "payload_bytes=%d submit_to_ready_ms=%.3f",
+                    direction,
+                    self.attn_tp_rank,
+                    ack.op_ids,
+                    stats.payload_bytes,
+                    elapsed_ms,
+                )
             if ack.kind is _AckKind.WRITE_BACK:
                 # An L2 write with L3 pages is acknowledged after its backup.
                 self._complete_or_queue_write(ack, results)

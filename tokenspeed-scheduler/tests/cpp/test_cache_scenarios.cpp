@@ -5353,11 +5353,14 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
 }
 
 TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
+    const auto free_at_start = scheduler_->AvailableLcmBlocks();
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
     ASSERT_TRUE(stream_wb.has_value());
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
     const std::int32_t free_after_reap = scheduler_->AvailableLcmBlocks();
+    EXPECT_EQ(free_after_reap, free_at_start - 6)
+        << "six Device blocks remain unavailable before WriteBackDone";
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
@@ -5545,6 +5548,74 @@ TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     AckWriteBacks(PlanOnce());
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the host-hit request";
+}
+
+TEST_F(HostHitSuite, RepeatedHostLoadBackKeepsPoolBalanced) {
+    const auto device_capacity = scheduler_->AvailableLcmBlocks();
+    const auto host_capacity = scheduler_->HostPoolFreeBlocks();
+    ASSERT_NO_FATAL_FAILURE(SeedHostThenEvictDevice());
+
+    auto run_request = [&](const RequestSpec& spec, bool require_host_hit) {
+        Submit(spec);
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* forward = FindForwardBatch(plan);
+        ASSERT_NE(forward, nullptr);
+        ASSERT_EQ(forward->request_ids,
+                  std::vector<std::string>{spec.request_id});
+
+        const auto load = FindLoadBack(plan);
+        if (require_host_hit) {
+            ASSERT_TRUE(load.has_value());
+            EXPECT_EQ(forward->extend_prefix_lens.at(0), 8);
+            EXPECT_EQ(forward->input_lengths.at(0), 2);
+            EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
+        }
+        if (load) {
+            for (const auto op_id : load->op_ids) {
+                SendLoadBackDone(op_id);
+            }
+        }
+        EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+        AckWriteBacks(plan);
+        SendForwardDone(spec.request_id, {9001});
+        const ExecutionPlan finalize = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(finalize);
+        ASSERT_NE(decode, nullptr);
+        ASSERT_EQ(decode->request_ids,
+                  std::vector<std::string>{spec.request_id});
+        AckWriteBacks(finalize);
+        AckWriteBacks(FinishAndReap(spec.request_id));
+        AckWriteBacks(PlanOnce());
+
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), device_capacity);
+        EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+        EXPECT_EQ(scheduler_->HostPoolFreeBlocks() +
+                      scheduler_->HostPoolCachedBlocks(),
+                  host_capacity);
+    };
+
+    std::int32_t steady_host_free = 0;
+    for (int round = 0; round < 10; ++round) {
+        SCOPED_TRACE(round);
+        const auto suffix = std::to_string(round);
+
+        ASSERT_NO_FATAL_FAILURE(run_request(
+            MakeRequestSpec("repeat-hit-" + suffix, /*num_pages=*/5), true));
+        ASSERT_NO_FATAL_FAILURE(run_request(
+            MakeRequestSpec("repeat-churn-a-" + suffix, /*num_pages=*/5, 501),
+            false));
+        ASSERT_NO_FATAL_FAILURE(run_request(
+            MakeRequestSpec("repeat-churn-b-" + suffix, /*num_pages=*/5, 801),
+            false));
+
+        if (round == 0) {
+            steady_host_free = scheduler_->HostPoolFreeBlocks();
+        } else {
+            EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), steady_host_free)
+                << "repeating the same prefixes must not consume more Host blocks";
+        }
+    }
 }
 
 TEST_F(HostHitSuite, EmptyHostIndexEmitsNoLoadBack) {

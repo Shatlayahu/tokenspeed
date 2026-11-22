@@ -1352,3 +1352,181 @@ def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
         offset = generation * 16
         assert torch.equal(first.cpu(), host[offset : offset + 8])
         assert torch.equal(second.cpu(), host[offset + 8 : offset + 16])
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="requires an Ascend NPU",
+)
+def test_cache_ranges_dma_round_trip_across_multiple_device_buffers_npu():
+    transfer_cache_ranges = (
+        _load_host_transfer_contract_module()._transfer_cache_ranges
+    )
+
+    first = torch.arange(64, dtype=torch.int32, device="npu:0").to(torch.uint8)
+    second = torch.arange(48, dtype=torch.bfloat16, device="npu:0")
+    second_bytes = second.view(torch.uint8)
+
+    host = torch.zeros(96, dtype=torch.uint8, pin_memory=True)
+    ranges = ((0, 8, 0, 24), (1, 16, 48, 32))
+
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+
+    transfer_cache_ranges("d2h", (first, second), host, ranges, stream)
+    stream.synchronize()
+
+    assert torch.equal(host[0:24], first[8:32].cpu())
+    assert torch.equal(host[48:80], second_bytes[16:48].cpu())
+
+    host[0:24].fill_(7)
+    host[48:80].fill_(9)
+
+    transfer_cache_ranges("h2d", (first, second), host, ranges, stream)
+    stream.synchronize()
+
+    assert torch.equal(
+        first[8:32].cpu(),
+        torch.full((24,), 7, dtype=torch.uint8),
+    )
+    assert torch.equal(
+        second_bytes[16:48].cpu(),
+        torch.full((32,), 9, dtype=torch.uint8),
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="requires an Ascend NPU",
+)
+def test_block_transfer_round_trip_npu():
+    module = _load_host_transfer_contract_module()
+
+    # Reuse the existing geometry and block mapping.
+    # Use a non-overlapping Host layout for the real NPU DMA test.
+    # Group 0 occupies [0, 320) within each LCM block.
+    # Group 1 occupies [320, 1640) within each LCM block.
+    geometry = module.build_host_transfer_geometry(
+        rows=(
+            (0, 0, 100, 96, 80, 0, 4, 40),
+            (0, 0, 100, 96, 80, 40, 4, 40),
+            (1, 1, 200, 2048, 1320, 320, 1, 1000),
+        ),
+        layer_slices=((0, 2), (2, 0), (2, 1)),
+        group_packing=(4, 1),
+        host_lcm_block_bytes=1640,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=16,
+        num_device_buffers=2,
+    )
+    workspace = module.HostTransferWorkspace()
+
+    transfers = (
+        (1, 3, 2),
+        (0, 5, 4),
+        (0, 2, 1),
+        (1, 7, 1),
+    )
+
+    num_blocks, _ = workspace.load_block_transfers(
+        transfers,
+        geometry=geometry,
+    )
+
+    # Allocate real NPU buffers and initialize them from CPU tensors.
+    sizes = (1024, 16384)
+    device_buffers = []
+
+    for size in sizes:
+        cpu_data = (
+            torch.arange(size, dtype=torch.int32)
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        device_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+            device="npu:0",
+        )
+        device_data.copy_(cpu_data)
+        device_buffers.append(device_data)
+
+    host = torch.empty(
+        geometry.host_lcm_block_bytes * geometry.num_host_lcm_blocks,
+        dtype=torch.uint8,
+        pin_memory=True,
+    )
+
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+
+    ranges = module._make_block_ranges(
+        geometry,
+        workspace,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=geometry.num_field_rows,
+    )
+
+    # D2H: real Block-level Device -> Host transfer.
+    module.transfer_cache_blocks(
+        "d2h",
+        device_buffers,
+        host,
+        geometry,
+        workspace,
+        stream,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=geometry.num_field_rows,
+        backend="auto",
+        grid_cap=None,
+        layer_ready_flags=None,
+    )
+
+    stream.synchronize()
+
+    for buffer_index, device_offset, host_offset, num_bytes in ranges:
+        assert torch.equal(
+            host[host_offset : host_offset + num_bytes],
+            device_buffers[buffer_index][
+                device_offset : device_offset + num_bytes
+            ].cpu(),
+        )
+
+    print("NPU Block D2H: PASSED")
+
+    # Destroy the original Device contents to prove H2D restoration.
+    for buffer in device_buffers:
+        buffer.zero_()
+
+    torch.npu.synchronize()
+
+    # H2D: real Block-level Host -> Device restoration.
+    module.transfer_cache_blocks(
+        "h2d",
+        device_buffers,
+        host,
+        geometry,
+        workspace,
+        stream,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=geometry.num_field_rows,
+        backend="auto",
+        grid_cap=None,
+        layer_ready_flags=None,
+    )
+
+    stream.synchronize()
+
+    for buffer_index, device_offset, host_offset, num_bytes in ranges:
+        assert torch.equal(
+            device_buffers[buffer_index][
+                device_offset : device_offset + num_bytes
+            ].cpu(),
+            host[host_offset : host_offset + num_bytes],
+        )
+
+    print("NPU Block H2D: PASSED")
+    print("NPU Block Transfer Round Trip: PASSED")
