@@ -93,8 +93,10 @@ class BatchLogger:
         context_length: Callable[[str], int],
         cache_state_group_ids=(),
         cache_group_pages=None,
+        cache_stats=None,
     ) -> None:
         self._enabled = enabled
+        self._cache_stats = cache_stats
         self._decode_log_interval = decode_log_interval
         self._num_total_pages = num_total_pages
         self._spec_num_steps = spec_num_steps
@@ -148,6 +150,15 @@ class BatchLogger:
             self._log_extend(forward_op, num_extends, bs, stats)
         elif self._step % self._decode_log_interval == 0:
             self._log_decode(forward_op.request_ids, bs, stats)
+        else:
+            return
+
+        if self._cache_stats is not None:
+            hits, misses, evictions = self._cache_stats()
+            logger.info(
+                "Device Cache Stats: hits=%d, misses=%d, evictions=%d",
+                hits, misses, evictions,
+            )
 
     def _log_extend(self, forward_op, num_extends: int, bs: int, stats: dict) -> None:
         mode = "Prefill" if num_extends == bs else "Mix"
@@ -163,6 +174,23 @@ class BatchLogger:
         if len(self._seen_prefill_ids) > MAX_SEEN_PREFILL_IDS:
             self._seen_prefill_ids.clear()
         self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
+
+        # Per-request prefill/replay boundaries, using scheduler-issued positions.
+        for i in range(num_extends):
+            rid = forward_op.request_ids[i]
+            start = int(forward_op.extend_prefix_lens[i])
+            replay = int(forward_op.extend_replay_lens[i])
+            length = int(forward_op.input_lengths[i])
+            assert 0 <= replay <= length
+
+            logger.info(
+                "[PrefillBoundary] request=%s start=%d replay=%d "
+                "replay_range=[%d,%d) forward_range=[%d,%d)",
+                rid, start, replay,
+                start, start + replay,
+                start, start + length,
+            )
+
         logger.info(
             f"{mode!s} batch. #dp-rank: {self._dp_rank!s}, "
             f"#new-seq: {num_extends!s}, #new-token: {total_tokens!s}, "

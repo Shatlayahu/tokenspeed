@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -2078,6 +2079,28 @@ class ModelExecutor:
         self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
+        # Both TP ranks log the scheduler-issued context boundaries.
+        for i in range(num_extends):
+            start = int(forward_op.extend_prefix_lens[i])
+            replay = int(forward_op.extend_replay_lens[i])
+            length = int(forward_op.input_lengths[i])
+            if start > 0 or replay > 0:
+                logger.info(
+                    "[TPBoundary] request=%s start=%d replay=%d length=%d end=%d",
+                    forward_op.request_ids[i],
+                    start, replay, length, start + length,
+                )
+        replay_timing_enabled = os.environ.get("TS_LOG_REPLAY_TIMING") == "1"
+        replay_rows = [
+            (
+                str(forward_op.request_ids[i]),
+                int(forward_op.extend_prefix_lens[i]),
+                int(forward_op.extend_replay_lens[i]),
+                int(forward_op.input_lengths[i]),
+            )
+            for i in range(num_extends)
+        ]
+        replay_batch_tokens = sum(row[2] for row in replay_rows)
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
         timing_enabled = LOG_MM_TIMING
@@ -2312,6 +2335,17 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
+                    replay_start_event = None
+                    replay_end_event = None
+                    if replay_timing_enabled and num_extends:
+                        replay_start_event = self.device_module.Event(
+                            enable_timing=True
+                        )
+                        replay_end_event = self.device_module.Event(
+                            enable_timing=True
+                        )
+                        replay_start_event.record(self.execution_stream)
+
                     (
                         output_tokens,
                         output_lengths,
@@ -2343,6 +2377,29 @@ class ModelExecutor:
                         block_tables=block_tables,
                         block_tables_cpu=block_tables_cpu,
                     )
+                    if replay_end_event is not None:
+                        replay_end_event.record(self.execution_stream)
+                        # Diagnostic only: synchronize so this is actual
+                        # device elapsed time, not asynchronous CPU submit time.
+                        replay_end_event.synchronize()
+                        forward_gpu_ms = replay_start_event.elapsed_time(
+                            replay_end_event
+                        )
+                        for rid, start, replay, length in replay_rows:
+                            logger.info(
+                                "[ReplayTiming] request=%s "
+                                "replay_range=[%d,%d) "
+                                "forward_range=[%d,%d) "
+                                "replay_tokens=%d batch_replay_tokens=%d "
+                                "forward_gpu_ms=%.3f "
+                                "timing_scope=batch_forward_including_replay",
+                                rid,
+                                start, start + replay,
+                                start, start + length,
+                                replay, replay_batch_tokens,
+                                forward_gpu_ms,
+                            )
+
                     if timing_enabled:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start

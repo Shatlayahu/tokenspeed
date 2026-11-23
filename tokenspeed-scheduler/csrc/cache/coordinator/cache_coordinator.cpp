@@ -21,6 +21,8 @@
 #include "cache/coordinator/cache_coordinator.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
 #include <array>
 #include <functional>
 #include <limits>
@@ -161,11 +163,13 @@ bool CacheCoordinator::ClearDeviceCache() {
     pending_stores_.clear();
     storage_keys_.clear();
     storage_key_order_.clear();
+    suppress_eviction_stats_ = true;
     for (const auto& [group_id, location] : cached_locations) {
         // The cascade of an earlier eviction may already have taken this one.
         evictCachedBlock(group_id, location);
         FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
     }
+    suppress_eviction_stats_ = false;
     return true;
 }
 
@@ -621,6 +625,7 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
                                            tail.group_keys[i], tail.per_group[i], &page_hits[i]);
             (GroupIsState(i) ? state_accepts : kv_accepts) = accepts && (GroupIsState(i) ? state_accepts : kv_accepts);
         }
+
         if (kv_accepts && !kv_settled) {
             out.kv_tokens = boundary;
             kv_settled = true;
@@ -1300,6 +1305,9 @@ bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockL
     if (!removed) {
         return false;
     }
+    if (!suppress_eviction_stats_) {
+        ++device_cache_evictions_;
+    }
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
@@ -1311,6 +1319,9 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
         return false;
+    }
+    if (!suppress_eviction_stats_) {
+        ++device_cache_evictions_;
     }
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);

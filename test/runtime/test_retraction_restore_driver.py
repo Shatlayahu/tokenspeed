@@ -294,6 +294,10 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     assert scheduler.host_pool_pinned_blocks() == 0
     (decode,) = rnd.forwards
     assert list(decode.request_ids) == ["a"] and decode.num_extends() == 0
+    # A complete snapshot restores the decoding frontier directly:
+    # no prefill/replay is scheduled, so replay tokens and cost are zero.
+    assert len(decode.extend_replay_lens) == 0
+    assert list(decode.input_lengths) == [1]
     assert list(decode.request_pool_indices) == [restore.request_pool_index]
     assert list(decode.decode_input_ids) == [driver.last_token]
     driver.complete(rnd.ops)

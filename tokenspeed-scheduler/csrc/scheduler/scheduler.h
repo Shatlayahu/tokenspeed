@@ -110,6 +110,9 @@ public:
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
     std::int64_t TailCapEvictions() const { return coordinator_.TailCapEvictions(); }
+    std::int64_t DeviceCacheHits() const { return device_cache_hits_; }
+    std::int64_t DeviceCacheMisses() const { return device_cache_misses_; }
+    std::int64_t DeviceCacheEvictions() const { return coordinator_.DeviceCacheEvictions(); }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).
@@ -449,6 +452,8 @@ private:
     // when none): kept out of every batch until it is quiescent, then
     // retracted.
     std::int64_t plan_calls_{0};
+    std::int64_t device_cache_hits_{0};
+    std::int64_t device_cache_misses_{0};
     std::string forced_victim_id_;
 
     // Submission order -- the FIFO every scheduling phase walks, identical

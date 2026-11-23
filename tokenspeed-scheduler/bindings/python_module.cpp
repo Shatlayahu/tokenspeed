@@ -514,6 +514,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Host L2 entries pinned by a request -- a suspended request's image, or an in-flight transfer.")
         .def("tail_entries", &tokenspeed::Scheduler::TailEntries,
              "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
+        .def("device_cache_hits", &tokenspeed::Scheduler::DeviceCacheHits)
+        .def("device_cache_misses", &tokenspeed::Scheduler::DeviceCacheMisses)
+        .def("device_cache_evictions", &tokenspeed::Scheduler::DeviceCacheEvictions)
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))

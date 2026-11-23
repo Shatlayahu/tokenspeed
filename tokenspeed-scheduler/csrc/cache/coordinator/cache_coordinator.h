@@ -470,6 +470,7 @@ public:
     // per-prior cap has dropped.
     std::size_t NumTailEntries() const { return tails_.Size(); }
     std::int64_t TailCapEvictions() const { return tails_.CapEvictions(); }
+    std::int64_t DeviceCacheEvictions() const { return device_cache_evictions_; }
     // Group blocks a tail entry holds in group i: every block of the page
     // below T, the last one partial unless T is a multiple of the block span.
     std::int32_t TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const;
@@ -628,6 +629,8 @@ private:
     std::deque<CacheKey> storage_key_order_;
     std::size_t storage_key_limit_{0};
     CacheMutationSink cache_mutation_sink_;
+    std::int64_t device_cache_evictions_{0};
+    bool suppress_eviction_stats_{false};
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

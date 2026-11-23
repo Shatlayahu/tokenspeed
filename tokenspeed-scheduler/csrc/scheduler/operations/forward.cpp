@@ -323,6 +323,22 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // where the KV is already cached.
     const std::int32_t kv_tokens = std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens);
     const std::int32_t junction_tokens = kv_tokens > hit_tokens ? kv_tokens : 0;
+    if (hit_tokens > 0 || kv_tokens > 0) {
+        spdlog::info(
+            "[CheckpointBoundary] request={} "
+            "device_state_boundary={} host_state_boundary={} "
+            "device_kv_boundary={} host_kv_boundary={} "
+            "resume_boundary={} kv_boundary={} junction={}",
+            request->Id(),
+            match.probe.device.num_common_tokens,
+            match.probe.host.num_common_tokens,
+            match.probe.device.kv_tokens,
+            match.probe.host.kv_tokens,
+            hit_tokens,
+            kv_tokens,
+            junction_tokens
+        );
+    }
     _assert(junction_tokens == 0 || junction_tokens < request->PrefillSize(),
             "a junction lies inside the unmatched prompt");
 
@@ -394,6 +410,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
     recordAdmittedPages(plan, *admission);
+    if (admission->device_prefix_tokens > 0) {
+        ++device_cache_hits_;
+    } else {
+        ++device_cache_misses_;
+    }
 
     if (!match.extension_hashes.empty()) {
         // The Host-warm H2D destinations of full pages are filled on Host

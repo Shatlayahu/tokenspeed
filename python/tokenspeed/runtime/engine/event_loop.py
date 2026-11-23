@@ -469,6 +469,11 @@ class EventLoop:
             spec_num_tokens=specs.spec_num_tokens,
             cache_state_group_ids=specs.cache_state_group_ids,
             cache_group_pages=scheduler_cache_group_pages(self.scheduler),
+            cache_stats=lambda: (
+                self.scheduler.device_cache_hits(),
+                self.scheduler.device_cache_misses(),
+                self.scheduler.device_cache_evictions(),
+            ),
         )
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
         self.max_model_len = min(
