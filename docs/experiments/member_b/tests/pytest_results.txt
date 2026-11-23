@@ -1,0 +1,14 @@
+...........                                                              [100%]
+=============================== warnings summary ===============================
+../envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+../envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+  /home/u2601213486/envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0 owner does not match the current owner.
+    warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+
+../envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+../envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58
+  /home/u2601213486/envs/tokenspeed/lib/python3.11/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /usr/local/Ascend/cann-9.0.0/aarch64-linux/ascend_toolkit_install.info owner does not match the current owner.
+    warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+11 passed, 4 warnings in 3.81s

@@ -506,6 +506,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
+        .def("host_pool_total_blocks", &tokenspeed::Scheduler::HostPoolTotalBlocks)
+        .def("host_cache_evictions", &tokenspeed::Scheduler::HostCacheEvictions)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
         .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
              "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "

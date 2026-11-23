@@ -1,0 +1,2 @@
+0.8B: PASS; outputs_identical=True; rank0_events=True; rank1_events=True; completion_tokens=64
+4B: PASS; outputs_identical=True; rank0_events=True; rank1_events=True; completion_tokens=64

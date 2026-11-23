@@ -141,6 +141,18 @@ class CacheOpHooks:
         if self._device is None:
             return
         for op in cache_ops_from_plan(execution_plan):
+            if isinstance(op, (SnapshotOp, RestoreOp)):
+                import os
+                if os.environ.get("TS_RETRACTION_TRACE") == "1":
+                    logger.info(
+                        "[RetractionE2E] phase=submit rank=%d kind=%s "
+                        "request=%s op_id=%s transfers=%d",
+                        self._attn_tp_rank,
+                        type(op).__name__,
+                        op.request_id,
+                        op.op_id,
+                        len(op.transfers),
+                    )
             if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
                 self._num_inflight += 1
                 self._num_open += 1
@@ -200,6 +212,19 @@ class CacheOpHooks:
         events = []
         for payload in ready_payloads:
             e = cache_event_from_payload(payload)
+            import os
+            if (
+                os.environ.get("TS_RETRACTION_TRACE") == "1"
+                and type(e).__name__ in (
+                    "SnapshotDoneEvent", "RestoreDoneEvent"
+                )
+            ):
+                logger.info(
+                    "[RetractionE2E] phase=ack rank=%d kind=%s op_id=%s",
+                    self._attn_tp_rank,
+                    type(e).__name__,
+                    e.op_id,
+                )
             logger.debug(
                 f"[cache_poll] event: op_id={e.op_id!s} type={type(e).__name__!s}",
             )

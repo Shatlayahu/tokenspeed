@@ -1,0 +1,7 @@
+config,workload,requests,mean_latency_s,max_latency_s,cached_tokens,prompt_tokens,cache_hit_ratio,output_tokens_per_s,host_max_used_lcm,host_evictions_log_max,D2H_bytes_full_run,H2D_bytes_full_run,D2H_mean_submit_ready_ms,H2D_mean_submit_ready_ms
+ON4,high,3,0.9583,0.9805,2016,2043,0.9868,16.6958,21,0,1141211136,86925312,124.265,114.347
+ON4,low,9,2.0487,5.4636,0,12114,0.0,7.8097,21,0,1141211136,86925312,124.265,114.347
+OFF,high,3,2.6196,5.1228,0,2043,0.0,6.1078,0,0,0,0,0,0
+OFF,low,9,1.9536,5.4298,0,11115,0.0,8.19,0,0,0,0,0,0
+ON1,high,3,1.2958,1.3281,0,2043,0.0,12.3473,16,122,1223417856,0,34.126,0
+ON1,low,9,1.5782,1.6191,0,12114,0.0,10.1384,16,122,1223417856,0,34.126,0

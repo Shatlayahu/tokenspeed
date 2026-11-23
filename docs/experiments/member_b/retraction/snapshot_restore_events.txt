@@ -1,0 +1,64 @@
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=4 transfers=0
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=4 transfers=0
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=4
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=4
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=5 transfers=4
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=5 transfers=4
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=5
+[ts] [2026-11-23 13:47:36 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=5
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=7 transfers=0
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=7 transfers=0
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=7
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=7
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=8 transfers=4
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=8 transfers=4
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=8
+[ts] [2026-11-23 13:47:37 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=8
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=10 transfers=0
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=10 transfers=0
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=10
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=10
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=11 transfers=4
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=11 transfers=4
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=11
+[ts] [2026-11-23 13:47:38 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=11
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=13 transfers=0
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=13 transfers=0
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=13
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=13
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=14 transfers=4
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-sWR5hvdqBFv12aDSlTTbsSQE-01a208a9-8283-7438-b193-bb71e25263dd op_id=14 transfers=4
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=14
+[ts] [2026-11-23 13:47:39 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=14
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=4 transfers=0
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=4 transfers=0
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=4
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=4
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=5 transfers=4
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=5 transfers=4
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=5
+[ts] [2026-11-23 13:49:39 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=5
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=7 transfers=0
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=7 transfers=0
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=7
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=7
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=8 transfers=4
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=8 transfers=4
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=8
+[ts] [2026-11-23 13:49:40 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=8
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=10 transfers=0
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=10 transfers=0
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=10
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=10
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=11 transfers=4
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=11 transfers=4
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=11
+[ts] [2026-11-23 13:49:42 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=11
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=13 transfers=0
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=SnapshotOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=13 transfers=0
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=SnapshotDoneEvent op_id=13
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=SnapshotDoneEvent op_id=13
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 1] [RetractionE2E] phase=submit rank=1 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=14 transfers=4
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 0] [RetractionE2E] phase=submit rank=0 kind=RestoreOp request=cmpl-to56qnxKHOzaXhNxIQpSKP37-01a208ab-5f57-7799-ad7b-d19683519aa6 op_id=14 transfers=4
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 1] [RetractionE2E] phase=ack rank=1 kind=RestoreDoneEvent op_id=14
+[ts] [2026-11-23 13:49:43 ATTN TP RANK 0] [RetractionE2E] phase=ack rank=0 kind=RestoreDoneEvent op_id=14

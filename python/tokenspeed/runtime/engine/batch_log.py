@@ -154,6 +154,16 @@ class BatchLogger:
             return
 
         if self._cache_stats is not None:
+            logger.info(
+                "Host Cache Stats: total_lcm=%d used_lcm=%d "
+                "free_lcm=%d cached_entries=%d pinned_entries=%d evictions=%d",
+                stats["host_total_blocks"],
+                stats["host_total_blocks"] - stats["host_free_blocks"],
+                stats["host_free_blocks"],
+                stats["host_cached_blocks"],
+                stats["host_pinned_blocks"],
+                stats["host_cache_evictions"],
+            )
             hits, misses, evictions = self._cache_stats()
             logger.info(
                 "Device Cache Stats: hits=%d, misses=%d, evictions=%d",

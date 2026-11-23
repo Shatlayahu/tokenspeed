@@ -1,0 +1,13 @@
+config,workload,trial,request,latency_s,prompt_tokens,cached_tokens,output_tokens
+ON4,high,1,return_A,0.948935,681,672,16
+ON4,low,1,unique_0,5.463576,1346,0,16
+ON4,low,1,unique_1,1.63837,1346,0,16
+ON4,low,1,unique_2,1.620774,1346,0,16
+ON4,high,2,return_A,0.980547,681,672,16
+ON4,low,2,unique_0,1.630313,1346,0,16
+ON4,low,2,unique_1,1.696986,1346,0,16
+ON4,low,2,unique_2,1.592884,1346,0,16
+ON4,high,3,return_A,0.945493,681,672,16
+ON4,low,3,unique_0,1.573367,1346,0,16
+ON4,low,3,unique_1,1.605997,1346,0,16
+ON4,low,3,unique_2,1.61634,1346,0,16

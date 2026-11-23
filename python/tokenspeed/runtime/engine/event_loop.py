@@ -1071,6 +1071,11 @@ class EventLoop:
                 self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
+            "host_total_blocks": self.scheduler.host_pool_total_blocks(),
+            "host_cache_evictions": self.scheduler.host_cache_evictions(),
+            "host_free_blocks": self.scheduler.host_pool_free_blocks(),
+            "host_cached_blocks": self.scheduler.host_pool_cached_blocks(),
+            "host_pinned_blocks": self.scheduler.host_pool_pinned_blocks(),
         }
 
     def _record_scheduler_iteration_metrics(

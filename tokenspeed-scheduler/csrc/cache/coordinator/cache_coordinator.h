@@ -428,6 +428,10 @@ public:
     bool ContainsHostCachedBlock(const CacheKey& key) const;
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
+    std::int32_t TotalHostLcmBlocks() const {
+        return host_pool_ == nullptr ? 0 : host_pool_->NumLcmBlocks();
+    }
+    std::uint64_t HostCacheEvictions() const { return host_cache_evictions_; }
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
     // Publishes a Device block a restore filled from Host L2
@@ -616,6 +620,7 @@ private:
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
+    std::uint64_t host_cache_evictions_{0};
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
