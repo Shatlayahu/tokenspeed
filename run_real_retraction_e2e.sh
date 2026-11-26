@@ -55,7 +55,7 @@ for SIZE in 0.8B 4B; do
 
         LOG="$OUT/${SIZE}_${PHASE}.log"
 
-        setsid bash /tmp/serve_qwen35_hosthit_b.sh \
+        setsid bash test/ci_system/serve_qwen35_hosthit_b.sh \
             --kvstore-ratio 4 \
             --max-total-tokens 16384 \
             "${EXTRA[@]}" \
@@ -88,7 +88,7 @@ for SIZE in 0.8B 4B; do
         fi
 
         PYTHONDONTWRITEBYTECODE=1 \
-        python -B /tmp/test_real_retraction_e2e.py \
+        python -B test/runtime/test_real_retraction_e2e.py \
             --model "$TS_SERVED_MODEL_NAME" \
             --phase "$PHASE" \
             --out "$OUT"
